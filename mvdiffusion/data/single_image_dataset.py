@@ -77,6 +77,7 @@ class SingleImageDataset(Dataset):
         gt_path: Optional[str] = None,
         margin_size: Optional[int] = 0,
         smpl_folder: Optional[str] = None,
+        back_image: Optional[str] = None,
         ) -> None:
         """Create a dataset from a folder of images.
         If you pass in a root directory it will be searched for images
@@ -89,6 +90,7 @@ class SingleImageDataset(Dataset):
         self.bg_color = bg_color
         self.cond_type = cond_type
         self.gt_path = gt_path
+        self.back_image = back_image
 
         
         if single_image is None:
@@ -102,6 +104,7 @@ class SingleImageDataset(Dataset):
         self.all_images = []
         self.all_alphas = []
         self.all_faces = []
+        self.all_back_images = []
     
         self.all_face_embeddings = []
         bg_color = self.get_bg_color()
@@ -115,16 +118,30 @@ class SingleImageDataset(Dataset):
         else:
             for file in self.file_list:
                 print(os.path.join(self.root_dir, file))
-                image, alpha = self.load_image(os.path.join(self.root_dir, file), bg_color, return_type='pt')
+                image_path = os.path.join(self.root_dir, file)
+                image, alpha = self.load_image(image_path, bg_color, return_type='pt')
                 self.all_images.append(image)
                 self.all_alphas.append(alpha)
+
+                back_image = image
+                back_path = self._find_back_image_path(file)
+                if back_path is not None:
+                    try:
+                        back_image, _ = self.load_image(back_path, bg_color, return_type='pt')
+                    except Exception:
+                        back_image = image
+                self.all_back_images.append(back_image)
                 
                 face, _ = self.load_face(os.path.join(self.root_dir, file), bg_color, return_type='pt')
                 self.all_faces.append(face)
+
+        if single_image is not None:
+            self.all_back_images = [self.all_images[0]]
                 
         self.all_images = self.all_images[:num_validation_samples]
         self.all_alphas = self.all_alphas[:num_validation_samples]
         self.all_faces = self.all_faces[:num_validation_samples]
+        self.all_back_images = self.all_back_images[:num_validation_samples]
             
         ic(len(self.all_images))
         
@@ -144,6 +161,27 @@ class SingleImageDataset(Dataset):
         file_name = file.split('.')[0]
         face_info = np.load(f'{self.root_dir}/{file_name}_face_info.npy', allow_pickle=True).item()
         return face_info
+
+    def _find_back_image_path(self, filename: str) -> Optional[str]:
+        if self.back_image:
+            if os.path.isabs(self.back_image):
+                return self.back_image
+            return os.path.join(self.root_dir, self.back_image)
+
+        stem, ext = os.path.splitext(filename)
+        candidates = []
+        if "-front" in stem:
+            candidates.append(stem.replace("-front", "-back") + ext)
+        if "_front" in stem:
+            candidates.append(stem.replace("_front", "_back") + ext)
+        candidates.append(stem + "-back" + ext)
+        candidates.append(stem + "_back" + ext)
+
+        for cand in candidates:
+            path = os.path.join(self.root_dir, cand)
+            if os.path.exists(path):
+                return path
+        return None
         
 
     def get_bg_color(self):
@@ -277,16 +315,24 @@ class SingleImageDataset(Dataset):
     
     def __getitem__(self, index):
         image = self.all_images[index%len(self.all_images)]
+        back_image = self.all_back_images[index%len(self.all_images)]
         # alpha = self.all_alphas[index%len(self.all_images)]
         if self.file_list is not None:
             filename = self.file_list[index%len(self.all_images)].replace(".png", "")
         else:
             filename = 'null'
-        img_tensors_in = [
-            image.permute(2, 0, 1)
-        ] * (self.num_views-1) + [
-            self.all_faces[index%len(self.all_images)].permute(2, 0, 1)
-        ]
+
+        if self.num_views - 1 == 6:
+            cond_views = [image, image, image, back_image, back_image, image]
+            img_tensors_in = [tmp.permute(2, 0, 1) for tmp in cond_views] + [
+                self.all_faces[index%len(self.all_images)].permute(2, 0, 1)
+            ]
+        else:
+            img_tensors_in = [
+                image.permute(2, 0, 1)
+            ] * (self.num_views-1) + [
+                self.all_faces[index%len(self.all_images)].permute(2, 0, 1)
+            ]
     
 
         img_tensors_in = torch.stack(img_tensors_in, dim=0).float() # (Nv, 3, H, W)

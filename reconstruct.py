@@ -396,7 +396,7 @@ class ReMesh:
         vertices = meshes.verts_packed().float()
         faces = meshes.faces_packed().long()
         colors = meshes.textures.verts_features_packed().float()
-        save_mesh(f'./{case_path}/result_clr_scale{self.opt.scale}_{case}.obj', vertices, faces, colors)
+        save_mesh(f'{case_path}/result_clr_scale{self.opt.scale}_{case}.obj', vertices, faces, colors)
         self.evaluate(vertices, colors, faces,  save_path=f'{case_path}/result_clr_scale{self.opt.scale}_{case}.mp4', save_nrm=True)
         
 
