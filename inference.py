@@ -15,6 +15,7 @@ from einops import rearrange
 from rembg import remove, new_session
 import pdb
 from mvdiffusion.pipelines.pipeline_mvdiffusion_unclip import StableUnCLIPImg2ImgPipeline
+from mvdiffusion.models_unclip.unet_mv2d_condition import UNetMV2DConditionModel
 from econdataset import SMPLDataset
 from reconstruct import ReMesh
 providers = [
@@ -56,6 +57,9 @@ class TestConfig:
     with_smpl: Optional[bool]
     
     recon_opt: Dict
+    prompt: Optional[str] = None
+    color_prompt: Optional[str] = None
+    normal_prompt: Optional[str] = None
 
 
 def convert_to_numpy(tensor):
@@ -74,6 +78,58 @@ def save_image_numpy(ndarr, fp):
     im = Image.fromarray(ndarr)
     im.save(fp)
 
+
+def build_prompt_embeddings(pipeline, num_views: int, cfg: TestConfig) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    if not (cfg.prompt or cfg.color_prompt or cfg.normal_prompt):
+        return None
+
+    view_names_7 = ["front", "front_right", "right", "back", "left", "front_left", "face"]
+    view_names_9 = ["front", "front_right", "right", "back_right", "back", "back_left", "left", "front_left", "face"]
+    if num_views == 7:
+        view_names = view_names_7
+    elif num_views == 9:
+        view_names = view_names_9
+    else:
+        view_names = [f"view_{idx}" for idx in range(num_views)]
+
+    default_color = "a rendering image of 3D human, {view} view, color map."
+    default_normal = "a rendering image of 3D human, {view} view, normal map."
+    color_template = cfg.color_prompt or cfg.prompt or default_color
+    normal_template = cfg.normal_prompt or cfg.prompt or default_normal
+
+    def _expand(template: str) -> List[str]:
+        prompts = []
+        for view in view_names:
+            if "{view}" in template:
+                prompts.append(template.format(view=view))
+            else:
+                prompts.append(f"{template}, {view} view")
+        return prompts
+
+    color_prompts = _expand(color_template)
+    normal_prompts = _expand(normal_template)
+
+    tokenizer = pipeline.tokenizer
+    text_encoder = pipeline.text_encoder
+    device = pipeline.unet.device
+
+    def _encode(prompts: List[str]) -> torch.Tensor:
+        text_inputs = tokenizer(
+            prompts,
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        ).to(device)
+        if hasattr(text_encoder.config, "use_attention_mask") and text_encoder.config.use_attention_mask:
+            attention_mask = text_inputs.attention_mask
+        else:
+            attention_mask = None
+        embeds = text_encoder(text_inputs.input_ids, attention_mask=attention_mask)[0]
+        return embeds.detach().cpu()
+
+    return _encode(normal_prompts), _encode(color_prompts)
+
 def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  save_dir):
     pipeline.set_progress_bar_config(disable=True)
 
@@ -82,6 +138,7 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
     else:
         generator = torch.Generator(device=pipeline.unet.device).manual_seed(cfg.seed)
     
+    prompt_overrides = build_prompt_embeddings(pipeline, cfg.num_views, cfg)
     images_cond, pred_cat = [], defaultdict(list)
     for case_id, batch in tqdm(enumerate(dataloader)):
         images_cond.append(batch['imgs_in'][:, 0]) 
@@ -95,7 +152,12 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
         else:
             smpl_in = None
 
-        normal_prompt_embeddings, clr_prompt_embeddings = batch['normal_prompt_embeddings'], batch['color_prompt_embeddings'] 
+        if prompt_overrides is not None:
+            normal_prompt_embeddings, clr_prompt_embeddings = prompt_overrides
+            normal_prompt_embeddings = normal_prompt_embeddings.unsqueeze(0).repeat(batch['imgs_in'].shape[0], 1, 1, 1)
+            clr_prompt_embeddings = clr_prompt_embeddings.unsqueeze(0).repeat(batch['imgs_in'].shape[0], 1, 1, 1)
+        else:
+            normal_prompt_embeddings, clr_prompt_embeddings = batch['normal_prompt_embeddings'], batch['color_prompt_embeddings']
         prompt_embeddings = torch.cat([normal_prompt_embeddings, clr_prompt_embeddings], dim=0)
         prompt_embeddings = rearrange(prompt_embeddings, "B Nv N C -> (B Nv) N C")
 
@@ -135,7 +197,7 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                     vis_ = torch.stack(vis_, dim=0)
                     vis_ = make_grid(vis_, nrow=len(vis_), padding=0, value_range=(0, 1))
                     save_image(vis_, out_filename)
-            elif cfg.save_mode == 'rgb':
+            elif cfg.save_mode in ('rgb', 'rgba'):
                 for i in range(bsz//num_views):
                     scene =  batch['filename'][i].split('.')[0]
 
@@ -173,8 +235,21 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
      
 
 def load_pshuman_pipeline(cfg):
-    pipeline = StableUnCLIPImg2ImgPipeline.from_pretrained(cfg.pretrained_model_name_or_path, torch_dtype=weight_dtype)
+    unet = UNetMV2DConditionModel.from_pretrained(
+        cfg.pretrained_model_name_or_path,
+        subfolder="unet",
+        torch_dtype=weight_dtype,
+    )
+    pipeline = StableUnCLIPImg2ImgPipeline.from_pretrained(
+        cfg.pretrained_model_name_or_path,
+        unet=unet,
+        torch_dtype=weight_dtype,
+    )
     pipeline.unet.enable_xformers_memory_efficient_attention()
+    if hasattr(pipeline, 'enable_vae_slicing'):
+        pipeline.enable_vae_slicing()
+    if hasattr(pipeline, 'enable_vae_tiling'):
+        pipeline.enable_vae_tiling()
     if torch.cuda.is_available():
         pipeline.to('cuda')
     return pipeline
