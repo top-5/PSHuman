@@ -131,7 +131,10 @@ def project_color(meshes: Meshes, cameras: CamerasBase, image: torch.Tensor, use
 
     # find invalid faces
     cos_angles = (faces_normals * view_direction).sum(dim=1)
-    assert cos_angles.mean() < 0, f"The view direction is not correct. cos_angles.mean()={cos_angles.mean()}"
+    if cos_angles.mean() >= 0:
+        # Poisson reconstruction can produce inside-out meshes; auto-correct view direction
+        view_direction = -view_direction
+        cos_angles = -cos_angles
     selected_faces = unique_faces[cos_angles < -eps]
 
     # find verts
