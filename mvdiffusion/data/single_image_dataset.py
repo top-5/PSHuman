@@ -238,9 +238,9 @@ class SingleImageDataset(Dataset):
             alpha = torch.from_numpy(alpha)
         else:
             raise NotImplementedError
-        
+
         return img, alpha
-    
+
     def load_face(self, img_path, bg_color, return_type='np', Imagefile=None):
         # pil always returns uint8
         if Imagefile is None:
@@ -323,7 +323,13 @@ class SingleImageDataset(Dataset):
             filename = 'null'
 
         if self.num_views - 1 == 6:
-            cond_views = [image, image, image, back_image, back_image, image]
+            # Condition the true back view (180°, index 3) with back_image.
+            # This puts the real back-photo VAE latents into the back-view denoising,
+            # eliminating the bun hallucination that occurs when the front photo
+            # (which carries hair signal in its VAE latents) is used for the back view.
+            # Side views (indices 2, 4) still use front photo; noise_level in the
+            # pipeline config smears the hair signal for those views.
+            cond_views = [image, image, image, back_image, image, image]
             img_tensors_in = [tmp.permute(2, 0, 1) for tmp in cond_views] + [
                 self.all_faces[index%len(self.all_images)].permute(2, 0, 1)
             ]

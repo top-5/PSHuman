@@ -29,6 +29,10 @@ validation_guidance_scales: 3.0
 pipe_validation_kwargs:
   num_inference_steps: 75
   eta: 1.0
+  noise_level: 400  # adds noise to CLIP image embedding + VAE latents;
+                    # smears hair-style signal from front photo on side views,
+                    # making text guidance ("bald") relatively stronger there.
+                    # 400/1000 = 40% noise — text prompt has clear dominance over image structure.
 
 validation_grid_nrow: ${num_views}
 
