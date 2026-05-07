@@ -5,6 +5,10 @@ from omegaconf import OmegaConf
 from PIL import Image
 from dataclasses import dataclass
 from collections import defaultdict
+import json
+import subprocess
+import tempfile
+from pathlib import Path
 import torch
 import torch.utils.checkpoint
 from torchvision.utils import make_grid, save_image
@@ -61,6 +65,37 @@ class TestConfig:
     color_prompt: Optional[str] = None
     normal_prompt: Optional[str] = None
 
+    # ------------------------------------------------------------------ #
+    # Multi-view I/O hooks (added so we can study / replace the diffusion
+    # outputs that feed the mesh-carving stage).
+    #
+    # If `mv_dump_dir` is set, after the multiview diffusion runs we save the
+    # post-rembg RGBA PNGs that are about to be passed to ReMesh.optimize_case
+    # into  <mv_dump_dir>/<scene>/   as
+    #   color_<view>_masked.png    # 6 colour views (RGBA, bg-removed)
+    #   normals_<view>_masked.png  # 6 normal views (front_face has the close-
+    #                              # up face composited into top-right quadrant)
+    #   cond_input.png             # the conditioning input image fed to the
+    #                              # multiview diffusion
+    #   contact_sheet.png          # 7×2 grid: input | (color/normal × 6 views)
+    # File names match the on-disk convention used by ReMesh.load_training_data.
+    #
+    # If `mv_inject_dir` is set, the diffusion pipeline is SKIPPED for each
+    # scene whose <mv_inject_dir>/<scene>/ folder contains the 12 PNGs above.
+    # Those images are loaded straight off disk (resized to crop_size if
+    # needed), background-removed if alpha is missing, and passed to
+    # ReMesh.optimize_case unchanged. This lets you swap in manual / morphed /
+    # alternate multiview images and study how the carving + texture
+    # projection responds, with no other code changes.
+    # ------------------------------------------------------------------ #
+    mv_dump_dir: Optional[str] = None
+    mv_inject_dir: Optional[str] = None
+    # Force back-view replacements
+    force_back_image: Optional[str] = None  # path to back photo to force into 'back' color view
+    force_back_normals_from_depthpro: bool = False
+    flowier_python: Optional[str] = None  # python to run depthpro normals helper
+    depthpro_normals_script: Optional[str] = None
+
 
 def convert_to_numpy(tensor):
     return tensor.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
@@ -77,6 +112,75 @@ def save_image(tensor, fp):
 def save_image_numpy(ndarr, fp):
     im = Image.fromarray(ndarr)
     im.save(fp)
+
+
+# --------------------------------------------------------------------------- #
+# Multi-view I/O helpers (dump / inject) — see TestConfig docstring.
+# --------------------------------------------------------------------------- #
+def _dump_mv_layers(dump_root: str, scene: str, view_names: List[str],
+                     colors_pil: List, normals_pil: List, cond_tensor) -> None:
+    """Persist the 6 colour + 6 normal RGBA PNGs (post-rembg) plus the cond
+    image and a contact sheet, all into <dump_root>/<scene>/."""
+    out_dir = os.path.join(dump_root, scene)
+    os.makedirs(out_dir, exist_ok=True)
+    for view, c_im, n_im in zip(view_names, colors_pil, normals_pil):
+        # Save post-rembg RGBA layers (full canvas)
+        c_path = os.path.join(out_dir, f"color_{view}_masked.png")
+        n_path = os.path.join(out_dir, f"normals_{view}_masked.png")
+        c_im.save(c_path)
+        n_im.save(n_path)
+
+        # Also dump the alpha masks as separate L images, same resolution
+        try:
+            c_a = c_im.split()[-1]
+            n_a = n_im.split()[-1]
+            c_a.save(os.path.join(out_dir, f"mask_color_{view}.png"))
+            n_a.save(os.path.join(out_dir, f"mask_normals_{view}.png"))
+        except Exception as _:
+            pass
+    # Cond input (no alpha, RGB tensor in [0,1])
+    cond_pil = convert_to_pil(cond_tensor.detach().clamp(0, 1))
+    cond_pil.save(os.path.join(out_dir, "cond_input.png"))
+
+    # Contact sheet: row0 = cond | colors..., row1 = blank | normals...
+    cell = colors_pil[0].size[0]
+    sheet = Image.new("RGBA", (cell * (1 + len(view_names)), cell * 2), (0, 0, 0, 0))
+    sheet.paste(cond_pil.convert("RGBA").resize((cell, cell)), (0, 0))
+    for k, (c_im, n_im) in enumerate(zip(colors_pil, normals_pil)):
+        sheet.paste(c_im.convert("RGBA").resize((cell, cell)),
+                     ((k + 1) * cell, 0))
+        sheet.paste(n_im.convert("RGBA").resize((cell, cell)),
+                     ((k + 1) * cell, cell))
+    sheet.save(os.path.join(out_dir, "contact_sheet.png"))
+    print(f"[mv-dump] scene={scene}  wrote 12 layers + cond + sheet → {out_dir}")
+
+
+def _try_load_injected_mv(inject_dir: str, view_names: List[str], crop_size: int):
+    """Load 6 color + 6 normal RGBA PNGs from <inject_dir>/.
+
+    Returns (colors_pil, normals_pil) lists (each PIL.RGBA at crop_size²) or
+    None if any image is missing. If an image lacks alpha, rembg is run on it.
+    """
+    if not inject_dir or not os.path.isdir(inject_dir):
+        return None
+    colors_pil, normals_pil = [], []
+    for view in view_names:
+        cp = os.path.join(inject_dir, f"color_{view}_masked.png")
+        np_ = os.path.join(inject_dir, f"normals_{view}_masked.png")
+        if not (os.path.isfile(cp) and os.path.isfile(np_)):
+            return None
+        c_im = Image.open(cp).convert("RGBA").resize((crop_size, crop_size), Image.BILINEAR)
+        n_im = Image.open(np_).convert("RGBA").resize((crop_size, crop_size), Image.BILINEAR)
+        # Fallback alpha extraction if injected images are pure-RGB-with-bg.
+        # Only rembg if alpha channel is fully opaque AND there's a non-white
+        # background (heuristic: corner pixels not transparent).
+        if all(c_im.getextrema()[3][k] == 255 for k in (0, 1)):
+            c_im = remove(c_im.convert("RGB"), session=session)
+        if all(n_im.getextrema()[3][k] == 255 for k in (0, 1)):
+            n_im = remove(n_im.convert("RGB"), session=session)
+        colors_pil.append(c_im)
+        normals_pil.append(n_im)
+    return colors_pil, normals_pil
 
 
 def build_prompt_embeddings(pipeline, num_views: int, cfg: TestConfig) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
@@ -137,12 +241,31 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
         generator = None
     else:
         generator = torch.Generator(device=pipeline.unet.device).manual_seed(cfg.seed)
-    
+
+    # View ordering used by ReMesh.load_training_data — keep in sync.
+    MV_VIEWS = ['front_face', 'front_right', 'right', 'back', 'left', 'front_left']
+
     prompt_overrides = build_prompt_embeddings(pipeline, cfg.num_views, cfg)
     images_cond, pred_cat = [], defaultdict(list)
     for case_id, batch in tqdm(enumerate(dataloader)):
-        images_cond.append(batch['imgs_in'][:, 0]) 
-        
+        images_cond.append(batch['imgs_in'][:, 0])
+        scene = batch['filename'][0].split('.')[0] if 'filename' in batch else f"case_{case_id:03d}"
+
+        # ---------------- MV-INJECT: skip diffusion, load from disk ----------------
+        inject_loaded = None
+        if cfg.mv_inject_dir:
+            inject_dir = os.path.join(cfg.mv_inject_dir, scene)
+            inject_loaded = _try_load_injected_mv(inject_dir, MV_VIEWS, cfg.validation_dataset.crop_size)
+            if inject_loaded is not None:
+                colors_inj, normals_inj = inject_loaded
+                print(f"[mv-inject] scene={scene}  loaded 6+6 RGBA from {inject_dir}")
+                pose = econdata.__getitem__(case_id)
+                carving.optimize_case(scene, pose, colors_inj, normals_inj)
+                torch.cuda.empty_cache()
+                continue
+            else:
+                print(f"[mv-inject] scene={scene}  NO usable images at {inject_dir} — running diffusion as fallback")
+
         imgs_in = torch.cat([batch['imgs_in']]*2, dim=0)
         num_views = imgs_in.shape[1]
         imgs_in = rearrange(imgs_in, "B Nv C H W -> (B Nv) C H W")# (B*Nv, 3, H, W)
@@ -228,6 +351,62 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                     
                     colors = [remove(convert_to_pil(tensor), session=session) for tensor in colors[:6]]
                     normals = [remove(convert_to_pil(tensor), session=session) for tensor in normals[:6]]
+
+                    # Optional forced back-view replacements
+                    back_idx = MV_VIEWS.index('back')
+                    if cfg.force_back_image:
+                        try:
+                            forced = Image.open(cfg.force_back_image).convert('RGBA')
+                            # Remove background if no/misleading alpha
+                            if forced.getbands()[-1] != 'A' or forced.getextrema()[-1] == (255, 255):
+                                forced = remove(forced.convert('RGB'), session=session)
+                            # Fit forced back RGBA into target crop by matching subject bbox to current back bbox
+                            def bbox_from_alpha(img_rgba: Image.Image):
+                                a = img_rgba.split()[-1]
+                                np_a = (np.array(a) > 0).astype(np.uint8)
+                                ys, xs = np.where(np_a > 0)
+                                if len(xs) == 0:
+                                    return (0, 0, img_rgba.size[0], img_rgba.size[1])
+                                return (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+                            import numpy as np
+                            target_bbox = bbox_from_alpha(colors[back_idx])
+                            sx0, sy0, sx1, sy1 = bbox_from_alpha(forced)
+                            sw, sh = max(1, sx1 - sx0 + 1), max(1, sy1 - sy0 + 1)
+                            tw, th = max(1, target_bbox[2] - target_bbox[0] + 1), max(1, target_bbox[3] - target_bbox[1] + 1)
+                            scale = min(th / sh, tw / sw)
+                            new_w, new_h = max(1, int(round(forced.width * scale))), max(1, int(round(forced.height * scale)))
+                            forced_resized = forced.resize((new_w, new_h), Image.BILINEAR)
+                            # Center onto crop
+                            canvas = Image.new('RGBA', colors[back_idx].size, (0, 0, 0, 0))
+                            off_x = (canvas.width - new_w) // 2
+                            off_y = (canvas.height - new_h) // 2
+                            canvas.alpha_composite(forced_resized, (off_x, off_y))
+                            colors[back_idx] = canvas
+                            # Optionally compute normals from depthpro on the forced back
+                            if cfg.force_back_normals_from_depthpro:
+                                py = cfg.flowier_python or "/build/flowier/.venv/bin/python"
+                                script = cfg.depthpro_normals_script or "/build/seed/scripts/depthpro_normals.py"
+                                with tempfile.TemporaryDirectory() as tdir:
+                                    rgb_path = os.path.join(tdir, 'back_rgb.png')
+                                    mask_path = os.path.join(tdir, 'back_mask.png')
+                                    out_path = os.path.join(tdir, 'back_normals.png')
+                                    # Save RGB and mask
+                                    r, g, b, a = canvas.split()
+                                    Image.merge('RGB', (r, g, b)).save(rgb_path)
+                                    Image.merge('RGBA', (r, g, b, a)).save(mask_path)
+                                    cmd = [py, script, '--image', rgb_path, '--output', out_path, '--mask', mask_path]
+                                    try:
+                                        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                        normals[back_idx] = Image.open(out_path).convert('RGBA')
+                                    except subprocess.CalledProcessError as e:
+                                        print(f"[mv-force-back] depthpro normals failed: {e}")
+                        except Exception as e:
+                            print(f"[mv-force-back] failed to replace back view: {e}")
+
+                    # ---------------- MV-DUMP: save the carving inputs ----------
+                    if cfg.mv_dump_dir:
+                        _dump_mv_layers(cfg.mv_dump_dir, scene, MV_VIEWS,
+                                         colors, normals, img_in_)
         pose = econdata.__getitem__(case_id)
         carving.optimize_case(scene, pose, colors, normals)
         torch.cuda.empty_cache()   
