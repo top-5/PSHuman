@@ -95,6 +95,131 @@ class TestConfig:
     force_back_normals_from_depthpro: bool = False
     flowier_python: Optional[str] = None  # python to run depthpro normals helper
     depthpro_normals_script: Optional[str] = None
+    # DepthPro confidence-blend: replace low-confidence diffusion normals with
+    # DepthPro-derived normals across all 6 views.  ``depthpro_normals_blend_thresh``
+    # is the **norm-deviation threshold**: the decoded normal vector should be unit-
+    # length; pixels where |1 - ||decode(n)|||  > thresh are degenerate and get
+    # replaced by DepthPro.  Default 0.3 (catches near-black degenerate normals
+    # such as [18,18,18] which decode to magnitude 1.49, while leaving valid
+    # unit normals like (128,128,255) or (255,128,128) untouched).
+    depthpro_normals_blend: bool = False
+    depthpro_normals_blend_thresh: float = 0.3
+    # Original PSHuman pastes the 7th generated close-up normal tile into the
+    # upper-right quadrant of the front normal map.  This can corrupt shoulders
+    # and elbows when the close-up tile is not registered to the full body.
+    front_normal_face_patch: bool = True
+
+
+# ── DepthPro normals blend helper ──────────────────────────────────────────
+# Azimuths for views that are NOT horizontally flipped by PSHuman (j not in
+# [3,4]).  For hflipped views (back=j3, left=j4) the image is already in a
+# front-facing orientation, so we use azimuth=0 so DepthPro treats it as a
+# front-facing camera and produces correct camera-space depth gradients.
+_MV_VIEW_AZIMUTHS = {
+    'front_face': 0.0,
+    'front_right': 45.0,
+    'right': 90.0,
+    'back': 0.0,    # already hflipped by PSHuman
+    'left': 0.0,    # already hflipped by PSHuman
+    'front_left': 315.0,
+}
+
+
+def _blend_depthpro_normals(
+    colors: List,
+    normals: List,
+    mv_views: List[str],
+    cfg,
+) -> None:
+    """Run DepthPro on each colour view; blend into diffusion normals where
+    the diffusion result is near-neutral (low confidence).
+
+    Design:
+      INVARIANT: pixels where diffusion normal is a valid unit vector
+        (||decode(n)|| ≈ 1.0, deviation < thresh) are unchanged.
+      INVARIANT: pixels with degenerate diffusion normals
+        (||decode(n)|| >> 1 or << 1, e.g. near-black [18,18,18] → mag 1.49)
+        are fully replaced by DepthPro.
+      DOMAIN identity: a perfectly-unit diffusion normal map → unchanged.
+      PROOF: w_keep = clip((thresh - (|mag-1| - 0.05)) / thresh, 0, 1).
+        When norm_dev <= 0.05 (valid), w_keep=1 → keep diffusion.
+        When norm_dev >= thresh+0.05 (degenerate), w_keep=0 → use DepthPro.
+        Linear blend between.  QED.
+    """
+    import numpy as np
+
+    flowier_py = getattr(cfg, 'flowier_python', None) or '/build/flowier/.venv/bin/python'
+    dp_script  = getattr(cfg, 'depthpro_normals_script', None) or '/build/seed/scripts/depthpro_normals.py'
+    thresh = float(getattr(cfg, 'depthpro_normals_blend_thresh', 0.3))
+
+    if not os.path.exists(flowier_py) or not os.path.exists(dp_script):
+        print(f'[depthpro-blend] skipped: py={flowier_py} exists={os.path.exists(flowier_py)} '
+              f'script={dp_script} exists={os.path.exists(dp_script)}', flush=True)
+        return
+
+    total_replaced = 0
+    with tempfile.TemporaryDirectory() as tdir:
+        for vi, view in enumerate(mv_views):
+            c_im = colors[vi]
+            n_im = normals[vi]
+            azimuth = _MV_VIEW_AZIMUTHS.get(view, 0.0)
+            rgb_path  = os.path.join(tdir, f'dp_rgb_{view}.png')
+            mask_path = os.path.join(tdir, f'dp_mask_{view}.png')
+            out_path  = os.path.join(tdir, f'dp_normals_{view}.png')
+            try:
+                r, g, b, a = c_im.split()
+                Image.merge('RGB', (r, g, b)).save(rgb_path)
+                c_im.save(mask_path)
+                cmd = [
+                    flowier_py, dp_script,
+                    '--image', rgb_path,
+                    '--output', out_path,
+                    '--mask', mask_path,
+                    '--azimuth', str(azimuth),
+                ]
+                result = subprocess.run(cmd, check=True, capture_output=True, timeout=180)
+                if result.stderr:
+                    print(result.stderr.decode(), flush=True)
+            except Exception as e:
+                print(f'[depthpro-blend] {view} depthpro failed: {e}', flush=True)
+                continue
+
+            if not os.path.exists(out_path):
+                continue
+
+            dp_nrm = Image.open(out_path).convert('RGBA')
+            n_arr  = np.array(n_im.convert('RGBA'), dtype=np.float32)
+            dp_arr = np.array(
+                dp_nrm.resize(n_im.size, Image.BILINEAR), dtype=np.float32
+            )
+
+            # Norm-deviation confidence: decode normal to [-1,1] and check
+            # how far its magnitude deviates from 1.0 (unit-vector constraint).
+            # Valid normals have dev≈0; degenerate near-black ones have dev>>0.
+            n_decoded = n_arr[:, :, :3] * (2.0 / 255.0) - 1.0
+            n_mag     = np.linalg.norm(n_decoded, axis=-1)
+            norm_dev  = np.abs(n_mag - 1.0)
+            # w_keep ∈ [0,1]: 0 = fully replace with DepthPro, 1 = keep diffusion
+            # Small grace band of 0.05 before blend starts.
+            w_keep = np.clip(1.0 - (norm_dev - 0.05) / max(thresh, 1e-6), 0.0, 1.0)[:, :, np.newaxis]
+
+            # Only blend subject pixels (alpha > 10 in both sources)
+            subj = (n_arr[:, :, 3:] > 10) & (dp_arr[:, :, 3:] > 10)
+            blended_rgb = w_keep * n_arr[:, :, :3] + (1.0 - w_keep) * dp_arr[:, :, :3]
+            out_arr = n_arr.copy()
+            out_arr[:, :, :3] = np.where(subj, blended_rgb, n_arr[:, :, :3])
+
+            n_replaced = int(((w_keep[:, :, 0] < 0.5) & subj[:, :, 0]).sum())
+            total_replaced += n_replaced
+            print(f'[depthpro-blend] {view}: {n_replaced} px DepthPro-dominant '
+                  f'(thresh={thresh})', flush=True)
+
+            normals[vi] = Image.fromarray(
+                out_arr.clip(0, 255).astype(np.uint8), 'RGBA'
+            )
+
+    print(f'[depthpro-blend] done — {total_replaced} px replaced across '
+          f'{len(mv_views)} views', flush=True)
 
 
 def convert_to_numpy(tensor):
@@ -347,7 +472,8 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                         # rgb_filename = f"color_{view}_masked.png"
                         # save_image(normal, os.path.join(scene_dir, normal_filename))
                         # save_image(color, os.path.join(scene_dir, rgb_filename))
-                    normals[0][:, :256, 256:512] =  normals[-1]
+                    if cfg.front_normal_face_patch:
+                        normals[0][:, :256, 256:512] = normals[-1]
                     
                     colors = [remove(convert_to_pil(tensor), session=session) for tensor in colors[:6]]
                     normals = [remove(convert_to_pil(tensor), session=session) for tensor in normals[:6]]
@@ -360,28 +486,33 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                             # Remove background if no/misleading alpha
                             if forced.getbands()[-1] != 'A' or forced.getextrema()[-1] == (255, 255):
                                 forced = remove(forced.convert('RGB'), session=session)
-                            # Fit forced back RGBA into target crop by matching subject bbox to current back bbox
-                            def bbox_from_alpha(img_rgba: Image.Image):
-                                a = img_rgba.split()[-1]
-                                np_a = (np.array(a) > 0).astype(np.uint8)
-                                ys, xs = np.where(np_a > 0)
-                                if len(xs) == 0:
-                                    return (0, 0, img_rgba.size[0], img_rgba.size[1])
-                                return (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+                            # Preprocess using the SAME logic as load_image() in testdata_with_smpl.py:
+                            #   1. Tight bbox crop around subject alpha
+                            #   2. Scale so max(h,w) = crop_size  (aspect-ratio preserving)
+                            #   3. Center-pad to crop_size × crop_size
+                            # This is exactly what PSHuman does with the front input photo, so
+                            # the back subject lands at the same scale on the same canvas.
+                            # No comparison to the diffusion-generated back view is needed or wanted.
                             import numpy as np
-                            target_bbox = bbox_from_alpha(colors[back_idx])
-                            sx0, sy0, sx1, sy1 = bbox_from_alpha(forced)
-                            sw, sh = max(1, sx1 - sx0 + 1), max(1, sy1 - sy0 + 1)
-                            tw, th = max(1, target_bbox[2] - target_bbox[0] + 1), max(1, target_bbox[3] - target_bbox[1] + 1)
-                            scale = min(th / sh, tw / sw)
-                            new_w, new_h = max(1, int(round(forced.width * scale))), max(1, int(round(forced.height * scale)))
-                            forced_resized = forced.resize((new_w, new_h), Image.BILINEAR)
-                            # Center onto crop
-                            canvas = Image.new('RGBA', colors[back_idx].size, (0, 0, 0, 0))
-                            off_x = (canvas.width - new_w) // 2
-                            off_y = (canvas.height - new_h) // 2
-                            canvas.alpha_composite(forced_resized, (off_x, off_y))
+                            crop_size = cfg.validation_dataset.crop_size
+                            # Final canvas must match the diffusion output size (image_size, not crop_size)
+                            # load_image() in testdata_with_smpl.py does: scale to crop_size, then
+                            # add_margin(size=image_size).  Use the front view's actual pixel size.
+                            image_size = colors[0].size[0]
+                            alpha_np = np.asarray(forced)[:, :, 3]
+                            coords = np.stack(np.nonzero(alpha_np), 1)[:, (1, 0)]
+                            if len(coords):
+                                min_x, min_y = np.min(coords, 0)
+                                max_x, max_y = np.max(coords, 0)
+                                forced = forced.crop((int(min_x), int(min_y), int(max_x), int(max_y)))
+                            h, w = forced.height, forced.width
+                            scale = crop_size / max(h, w)
+                            forced = forced.resize((max(1, int(round(w * scale))), max(1, int(round(h * scale)))), Image.BILINEAR)
+                            canvas = Image.new('RGBA', (image_size, image_size), (0, 0, 0, 0))
+                            canvas.paste(forced, ((image_size - forced.width) // 2, (image_size - forced.height) // 2))
                             colors[back_idx] = canvas
+                            print(f"[mv-force-back] back photo → tight-crop({w}x{h}) scale={scale:.4f} "
+                                  f"→ {forced.width}x{forced.height} → padded {image_size}x{image_size} (image_size={image_size} crop_size={crop_size})")
                             # Optionally compute normals from depthpro on the forced back
                             if cfg.force_back_normals_from_depthpro:
                                 py = cfg.flowier_python or "/build/flowier/.venv/bin/python"
@@ -402,6 +533,10 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                                         print(f"[mv-force-back] depthpro normals failed: {e}")
                         except Exception as e:
                             print(f"[mv-force-back] failed to replace back view: {e}")
+
+                    # ── DepthPro confidence-blend on diffusion normals ────────
+                    if cfg.depthpro_normals_blend:
+                        _blend_depthpro_normals(colors, normals, MV_VIEWS, cfg)
 
                     # ---------------- MV-DUMP: save the carving inputs ----------
                     if cfg.mv_dump_dir:
