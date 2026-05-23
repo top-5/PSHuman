@@ -1,5 +1,7 @@
 from typing import List
+import os
 import torch
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from pytorch3d.renderer.cameras import look_at_view_transform, OrthographicCameras, CamerasBase
@@ -41,6 +43,7 @@ def render_pix2faces_py3d(meshes, cameras, H=512, W=512, blur_radius=0.0, faces_
     fragments: Fragments = rasterizer(meshes, cameras=cameras)
     return {
         "pix_to_face": fragments.pix_to_face[..., 0],
+        "zbuf": fragments.zbuf[..., 0],
     }
 
 import nvdiffrast.torch as dr
@@ -97,7 +100,25 @@ def get_visible_faces(meshes: Meshes, cameras: CamerasBase, resolution=1024):
     unique_faces = unique_faces[unique_faces != -1]
     return unique_faces
 
-def project_color(meshes: Meshes, cameras: CamerasBase, image: torch.Tensor, use_alpha=True, eps=0.05, resolution=1024, device="cuda") -> dict:
+def get_visibility_buffers(meshes: Meshes, cameras: CamerasBase, resolution=1024):
+    return render_pix2faces_py3d(meshes, cameras, H=resolution, W=resolution)
+
+def project_color(
+    meshes: Meshes,
+    cameras: CamerasBase,
+    image: torch.Tensor,
+    normal_image: torch.Tensor = None,
+    use_alpha=True,
+    eps=0.05,
+    resolution=1024,
+    device="cuda",
+    normal_gate_threshold=0.35,
+    depth_tol=None,
+    depth_edge_tol=None,
+    depth_edge_dilate_px=0,
+    alpha_erode_px=0,
+    alpha_edge_threshold=0.95,
+) -> dict:
     """
     Projects color from a given image onto a 3D mesh.
 
@@ -120,7 +141,11 @@ def project_color(meshes: Meshes, cameras: CamerasBase, image: torch.Tensor, use
     meshes = meshes.to(device)
     cameras = cameras.to(device)
 
-    unique_faces = get_visible_faces(meshes, cameras, resolution=resolution)
+    visibility = get_visibility_buffers(meshes, cameras, resolution=resolution)
+    pix_to_face = visibility["pix_to_face"]
+    zbuf = visibility["zbuf"]
+    unique_faces = torch.unique(pix_to_face.flatten())
+    unique_faces = unique_faces[unique_faces != -1]
 
     # visible faces
     faces_normals = meshes.faces_normals_packed()[unique_faces]
@@ -143,29 +168,156 @@ def project_color(meshes: Meshes, cameras: CamerasBase, image: torch.Tensor, use
     verts_coordinates = meshes.verts_packed()[verts]   # [N, 3]
 
     # compute color
-    pt_tensor = cameras.transform_points(verts_coordinates)[..., :2] # NDC space points
-    valid = ~((pt_tensor.isnan()|(pt_tensor<-1)|(1<pt_tensor)).any(dim=1))  # checked, correct
+    projected = cameras.transform_points(verts_coordinates)
+    view_z = cameras.get_world_to_view_transform().transform_points(verts_coordinates)[..., 2:3]
+    pt_tensor = projected[..., :2] # NDC space points
+    valid = ~(projected.isnan().any(dim=1) | (pt_tensor < -1).any(dim=1) | (1 < pt_tensor).any(dim=1))  # checked, correct
     valid_pt = pt_tensor[valid, :]
     valid_idx = verts[valid]
-    valid_color = torch.nn.functional.grid_sample(image[None].flip((-1, -2)), valid_pt[None, :, None, :], align_corners=False, padding_mode="reflection", mode="bilinear")[0, :, :, 0].T.clamp(0, 1)   # [N, 4], note that bicubic may give invalid value
+    valid_z = view_z[valid]
+    # Face-level visibility is not sufficient: a side-view dress triangle can
+    # be partly visible while one of its vertices projects behind the arm.
+    # Sampling color at that hidden vertex burns an arm-shaped silhouette into
+    # the dress. Gate each vertex by the rasterized nearest depth at its own
+    # projected pixel before sampling source color.
+    zbuf_sample = zbuf[0][None, None].flip((-1, -2))
+    sampled_z = torch.nn.functional.grid_sample(
+        zbuf_sample,
+        valid_pt[None, :, None, :],
+        align_corners=False,
+        padding_mode="zeros",
+        mode="nearest",
+    )[0, :, :, 0].T
+    if depth_tol is None:
+        depth_tol = float(os.environ.get("PSHUMAN_TEXTURE_DEPTH_TOL", "0.01"))
+    if depth_edge_tol is None:
+        depth_edge_tol = float(os.environ.get("PSHUMAN_TEXTURE_DEPTH_EDGE_TOL", "0.006"))
+    z_tol = float(depth_tol)
+    edge_tol = float(depth_edge_tol)
+    vertex_visible = (sampled_z >= 0) & ((sampled_z - valid_z).abs() <= z_tol)
+    if edge_tol > 0 and valid_pt.numel() > 0:
+        # The side-view arm bleed sits exactly on a depth discontinuity: the
+        # vertex itself can sample the dress depth while adjacent source pixels
+        # still belong to the foreground arm/antialiased cutout. Reject samples
+        # whose 3x3 depth neighborhood is not locally flat before color lookup.
+        ndc_step = 2.0 / float(resolution)
+        offsets = torch.tensor(
+            [
+                [-1.0, -1.0], [0.0, -1.0], [1.0, -1.0],
+                [-1.0,  0.0], [0.0,  0.0], [1.0,  0.0],
+                [-1.0,  1.0], [0.0,  1.0], [1.0,  1.0],
+            ],
+            device=device,
+            dtype=valid_pt.dtype,
+        ) * ndc_step
+        neigh_pt = (valid_pt[:, None, :] + offsets[None, :, :]).clamp(-1.0, 1.0)
+        neigh_z = torch.nn.functional.grid_sample(
+            zbuf_sample,
+            neigh_pt[None, :, :, :],
+            align_corners=False,
+            padding_mode="zeros",
+            mode="nearest",
+        )[0, :, :, 0].T
+        neigh_valid = neigh_z >= 0
+        z_delta = torch.where(neigh_valid, (neigh_z - sampled_z).abs(), torch.zeros_like(neigh_z))
+        local_depth_edge = z_delta.max(dim=1, keepdim=True).values > edge_tol
+        vertex_visible = vertex_visible & ~local_depth_edge
+        if int(depth_edge_dilate_px) > 0:
+            # For side/oblique views, the generated colour image can smear the
+            # foreground arm contour onto the surface just behind it. Reject a
+            # configurable corridor around any rasterized depth discontinuity,
+            # independent of material colour.
+            dilate = int(depth_edge_dilate_px)
+            finite = zbuf_sample >= 0
+            z_for_max = torch.where(finite, zbuf_sample, torch.full_like(zbuf_sample, -1e6))
+            z_for_min = torch.where(finite, zbuf_sample, torch.full_like(zbuf_sample, 1e6))
+            k_edge = 3
+            max_z = F.max_pool2d(z_for_max, kernel_size=k_edge, stride=1, padding=k_edge // 2)
+            min_z = -F.max_pool2d(-z_for_min, kernel_size=k_edge, stride=1, padding=k_edge // 2)
+            depth_edge = ((max_z - min_z) > edge_tol) & finite
+            k_dilate = 2 * dilate + 1
+            depth_edge = F.max_pool2d(
+                depth_edge.to(zbuf_sample.dtype),
+                kernel_size=k_dilate,
+                stride=1,
+                padding=dilate,
+            )
+            sampled_depth_edge = torch.nn.functional.grid_sample(
+                depth_edge,
+                valid_pt[None, :, None, :],
+                align_corners=False,
+                padding_mode="zeros",
+                mode="nearest",
+            )[0, :, :, 0].T
+            vertex_visible = vertex_visible & (sampled_depth_edge < 0.5)
+    valid_pt = valid_pt[vertex_visible[:, 0], :]
+    valid_idx = valid_idx[vertex_visible[:, 0]]
+    if valid_idx.numel() == 0:
+        return {
+            "new_texture": meshes.textures,
+            "valid_verts": valid_idx,
+            "valid_colors": torch.empty((0, 3), device=device, dtype=meshes.verts_packed().dtype),
+            "valid_alpha": torch.empty((0, 1), device=device, dtype=meshes.verts_packed().dtype),
+            "cos_angles": torch.empty((0,), device=device, dtype=meshes.verts_packed().dtype),
+            "normal_gate": torch.empty((0, 1), device=device, dtype=meshes.verts_packed().dtype),
+            "vertex_visible": vertex_visible,
+        }
+    valid_color = torch.nn.functional.grid_sample(image[None].flip((-1, -2)), valid_pt[None, :, None, :], align_corners=False, padding_mode="border", mode="bilinear")[0, :, :, 0].T.clamp(0, 1)   # [N, 4], note that bicubic may give invalid value
     alpha, valid_color = valid_color[:, 3:], valid_color[:, :3]
     if not use_alpha:
         alpha = torch.ones_like(alpha)
+    elif alpha_erode_px > 0:
+        # Reject samples close to source RGBA cutout edges. Those pixels are
+        # where side-view arm/background antialiasing most often bleeds into
+        # dark clothing vertices.
+        edge_alpha = image[3:4][None]
+        for _ in range(int(alpha_erode_px)):
+            edge_alpha = -F.max_pool2d(-edge_alpha, kernel_size=3, stride=1, padding=1)
+        safe_alpha = torch.nn.functional.grid_sample(
+            edge_alpha.flip((-1, -2)),
+            valid_pt[None, :, None, :],
+            align_corners=False,
+            padding_mode="zeros",
+            mode="bilinear",
+        )[0, :, :, 0].T.clamp(0, 1)
+        alpha = alpha * (safe_alpha >= float(alpha_edge_threshold)).to(alpha.dtype)
 
-    # modify color
-    old_colors = meshes.textures.verts_features_packed()
-    old_colors[valid_idx] = valid_color * alpha + old_colors[valid_idx] * (1 - alpha)
-    new_texture = TexturesVertex(verts_features=[old_colors])
-    
+    # Do not mutate mesh vertex colors here. multiview_color_projection()
+    # accumulates all view samples below; mutating during sampling pollutes the
+    # "original color" fallback and can preserve arm-shaped side-view stains in
+    # low-confidence dress vertices.
+    new_texture = meshes.textures
+
     valid_verts_normals = meshes.verts_normals_packed()[valid_idx]
     valid_verts_normals = valid_verts_normals / valid_verts_normals.norm(dim=1, keepdim=True).clamp_min(0.001)
     cos_angles = (valid_verts_normals * view_direction).sum(dim=1)
+    normal_gate = torch.ones_like(alpha)
+    if normal_image is not None:
+        valid_normal = torch.nn.functional.grid_sample(
+            normal_image[None].flip((-1, -2)),
+            valid_pt[None, :, None, :],
+            align_corners=False,
+            padding_mode="reflection",
+            mode="bilinear",
+        )[0, :, :, 0].T.clamp(0, 1)
+        normal_alpha = valid_normal[:, 3:]
+        sampled_normals = valid_normal[:, :3] * 2.0 - 1.0
+        sampled_normals = sampled_normals / sampled_normals.norm(dim=1, keepdim=True).clamp_min(0.001)
+        normal_agreement = (sampled_normals * valid_verts_normals).sum(dim=1, keepdim=True)
+        # Source-side occlusion guard: reject pixels whose generated normal map
+        # belongs to a different surface than the vertex being colored. This
+        # prevents arm-color pixels from being accepted by dress vertices when
+        # the multiview color image contains a self-occlusion imprint.
+        normal_gate = ((normal_agreement - normal_gate_threshold) / (1.0 - normal_gate_threshold)).clamp(0, 1)
+        normal_gate = normal_gate * normal_alpha
     return {
         "new_texture": new_texture,
         "valid_verts": valid_idx,
         "valid_colors": valid_color,
         "valid_alpha": alpha,
         "cos_angles": cos_angles,
+        "normal_gate": normal_gate,
+        "vertex_visible": vertex_visible,
     }
 
 def complete_unseen_vertex_color(meshes: Meshes, valid_index: torch.Tensor) -> dict:
@@ -216,7 +368,30 @@ def complete_unseen_vertex_color(meshes: Meshes, valid_index: torch.Tensor) -> d
     meshes.textures = TexturesVertex(verts_features=[colors])
     return meshes
 
-def multiview_color_projection(meshes: Meshes, image_list: torch.Tensor, cameras_list: List[CamerasBase]=None, camera_focal: float = 2 / 1.35, weights=None, eps=0.05, resolution=1024, device="cuda", reweight_with_cosangle="square", use_alpha=True, confidence_threshold=0.1, complete_unseen=False, below_confidence_strategy="smooth") -> Meshes:
+def multiview_color_projection(
+    meshes: Meshes,
+    image_list: torch.Tensor,
+    normal_image_list: torch.Tensor = None,
+    cameras_list: List[CamerasBase]=None,
+    camera_focal: float = 2 / 1.35,
+    weights=None,
+    eps=0.05,
+    resolution=1024,
+    device="cuda",
+    reweight_with_cosangle="square",
+    use_alpha=True,
+    confidence_threshold=0.1,
+    complete_unseen=False,
+    below_confidence_strategy="smooth",
+    normal_gate_threshold=0.35,
+    depth_tol=None,
+    depth_edge_tol=None,
+    depth_edge_dilate_px=0,
+    alpha_erode_px=0,
+    alpha_edge_threshold=0.95,
+    side_occlusion_indices=None,
+    side_occlusion_guard=True,
+) -> Meshes:
     """
     Projects color from a given image onto a 3D mesh.
 
@@ -240,6 +415,8 @@ def multiview_color_projection(meshes: Meshes, image_list: torch.Tensor, cameras
     # 1. preprocess inputs
     if image_list is None:
         raise ValueError("image_list is None")
+    if normal_image_list is not None and len(normal_image_list) != len(image_list):
+        raise ValueError("normal_image_list must have the same length as image_list")
     if cameras_list is None:
         if len(image_list) == 8:
             cameras_list = get_8view_cameras(device, focal=camera_focal)
@@ -263,43 +440,104 @@ def multiview_color_projection(meshes: Meshes, image_list: torch.Tensor, cameras
             weights = [1.0, 1.0]
         else:
             raise ValueError("weights is None, and can not be guessed from image_list")
+    if side_occlusion_indices is None:
+        side_occlusion_indices = []
+    side_occlusion_indices = set(int(x) for x in side_occlusion_indices)
     
     # 2. run projection
     meshes = meshes.clone().to(device)
     assert len(cameras_list) == len(image_list) == len(weights)
-    original_color = meshes.textures.verts_features_packed()
+    original_color = meshes.textures.verts_features_packed().clone()
     assert not torch.isnan(original_color).any()
     texture_counts = torch.zeros_like(original_color[..., :1])
     texture_values = torch.zeros_like(original_color)
     max_texture_counts = torch.zeros_like(original_color[..., :1])
     max_texture_values = torch.zeros_like(original_color)
-    for camera, image, weight in zip(cameras_list, image_list, weights):
-        ret = project_color(meshes, camera, image, eps=eps, resolution=resolution, device=device, use_alpha=use_alpha)
+    normal_iter = normal_image_list if normal_image_list is not None else [None] * len(image_list)
+    gated_samples = 0
+    total_samples = 0
+    vertex_occluded_samples = 0
+    vertex_total_samples = 0
+
+    for view_i, (camera, image, normal_image, weight) in enumerate(zip(cameras_list, image_list, normal_iter, weights)):
+        view_depth_edge_dilate_px = (
+            int(depth_edge_dilate_px)
+            if side_occlusion_guard and int(view_i) in side_occlusion_indices
+            else 0
+        )
+        ret = project_color(
+            meshes,
+            camera,
+            image,
+            normal_image=normal_image,
+            eps=eps,
+            resolution=resolution,
+            device=device,
+            use_alpha=use_alpha,
+            normal_gate_threshold=normal_gate_threshold,
+            depth_tol=depth_tol,
+            depth_edge_tol=depth_edge_tol,
+            depth_edge_dilate_px=view_depth_edge_dilate_px,
+            alpha_erode_px=alpha_erode_px,
+            alpha_edge_threshold=alpha_edge_threshold,
+        )
+        if "vertex_visible" in ret:
+            vertex_visible = ret["vertex_visible"]
+            vertex_occluded_samples += int((~vertex_visible).sum().detach().cpu())
+            vertex_total_samples += int(vertex_visible.numel())
+        if ret["valid_verts"].numel() == 0:
+            continue
         if reweight_with_cosangle == "linear":
             weight = (ret['cos_angles'].abs() * weight)[:, None]
         elif reweight_with_cosangle == "square":
             weight = (ret['cos_angles'].abs() ** 2 * weight)[:, None]
         if use_alpha:
             weight = weight * ret['valid_alpha']
+        if normal_image is not None:
+            normal_gate = ret["normal_gate"]
+            gated_samples += int((normal_gate <= 0.05).sum().detach().cpu())
+            total_samples += int(normal_gate.numel())
+            weight = weight * normal_gate
         assert weight.min() > -0.0001
         texture_counts[ret['valid_verts']] += weight
         texture_values[ret['valid_verts']] += ret['valid_colors'] * weight
         max_texture_values[ret['valid_verts']] = torch.where(weight > max_texture_counts[ret['valid_verts']], ret['valid_colors'], max_texture_values[ret['valid_verts']])
         max_texture_counts[ret['valid_verts']] = torch.max(max_texture_counts[ret['valid_verts']], weight)
 
-    # Method2
-    texture_values = torch.where(texture_counts > confidence_threshold, texture_values / texture_counts, texture_values)
-    if below_confidence_strategy == "smooth":
-        texture_values = torch.where(texture_counts <= confidence_threshold, (original_color * (confidence_threshold - texture_counts) + texture_values) / confidence_threshold, texture_values)
-    elif below_confidence_strategy == "original":
-        texture_values = torch.where(texture_counts <= confidence_threshold, original_color, texture_values)
-    else:
+    # Normalize every filtered observation, not just high-confidence ones. The
+    # previous confidence-threshold fallback treated glancing but valid dress
+    # samples as "unseen", then Laplacian completion diffused arm/skin colors
+    # into the under-arm dress area. After source-side visibility/normal gates,
+    # a low-weight sample is still better evidence than global mesh smoothing.
+    observed = texture_counts > 1e-6
+    texture_values = torch.where(
+        observed,
+        texture_values / texture_counts.clamp_min(1e-6),
+        original_color,
+    )
+    if below_confidence_strategy not in ("smooth", "original"):
         raise ValueError(f"below_confidence_strategy={below_confidence_strategy} is not supported")
     assert not torch.isnan(texture_values).any()
     meshes.textures = TexturesVertex(verts_features=[texture_values])
-    
+    if total_samples:
+        print(
+            f"[project_mesh] normal-gated color samples: "
+            f"{gated_samples:,}/{total_samples:,} "
+            f"({100.0 * gated_samples / max(total_samples, 1):.1f}%)",
+            flush=True,
+        )
+    if vertex_total_samples:
+        print(
+            f"[project_mesh] vertex-occluded color samples: "
+            f"{vertex_occluded_samples:,}/{vertex_total_samples:,} "
+            f"({100.0 * vertex_occluded_samples / max(vertex_total_samples, 1):.1f}%)",
+            flush=True,
+        )
     if complete_unseen:
-        meshes = complete_unseen_vertex_color(meshes, torch.arange(texture_values.shape[0]).to(device)[texture_counts[:, 0] >= confidence_threshold])
+        meshes = complete_unseen_vertex_color(
+            meshes,
+            torch.arange(texture_values.shape[0]).to(device)[observed[:, 0]],
+        )
     ret_mesh = meshes.detach()
     del meshes
     return ret_mesh
