@@ -1238,6 +1238,144 @@ def keep_largest(mesh):
     return keep_mesh
 
 
+def _orthonormal_basis(axis):
+    axis = axis / (np.linalg.norm(axis) + 1e-9)
+    helper = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    if abs(np.dot(axis, helper)) > 0.9:
+        helper = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    u = np.cross(axis, helper)
+    u = u / (np.linalg.norm(u) + 1e-9)
+    v = np.cross(axis, u)
+    v = v / (np.linalg.norm(v) + 1e-9)
+    return u, v
+
+
+def _ordered_ring(ids, verts, center, axis, ring_n):
+    ids = np.asarray(ids, dtype=np.int64)
+    if len(ids) == 0:
+        return np.array([], dtype=np.int64)
+    u, v = _orthonormal_basis(axis)
+    rel = verts[ids] - center[None, :]
+    ang = np.arctan2(rel.dot(v), rel.dot(u))
+    order = np.argsort(ang)
+    ordered = ids[order]
+    if len(ordered) <= ring_n:
+        return ordered
+    pick = np.linspace(0, len(ordered) - 1, ring_n).astype(np.int64)
+    return ordered[pick]
+
+
+def _stitch_components(main_mesh, comp_mesh, ring_vertices=48):
+    main_v = np.asarray(main_mesh.vertices)
+    comp_v = np.asarray(comp_mesh.vertices)
+    main_tree = cKDTree(main_v)
+    dists, nn = main_tree.query(comp_v, k=1)
+    min_idx = int(np.argmin(dists))
+    gap = float(dists[min_idx])
+
+    p_comp = comp_v[min_idx]
+    p_main = main_v[int(nn[min_idx])]
+    axis = p_comp - p_main
+    if np.linalg.norm(axis) < 1e-6:
+        axis = comp_v.mean(axis=0) - main_v.mean(axis=0)
+    axis = axis / (np.linalg.norm(axis) + 1e-9)
+
+    main_tree_local = cKDTree(main_v)
+    comp_tree_local = cKDTree(comp_v)
+    base_radius = max(0.02, min(0.12, 1.5 * gap + 0.01))
+    main_seed = np.array([], dtype=np.int64)
+    comp_seed = np.array([], dtype=np.int64)
+
+    for mul in [1.0, 1.5, 2.0, 2.5, 3.0]:
+        r = base_radius * mul
+        m_ids = np.asarray(main_tree_local.query_ball_point(p_main, r), dtype=np.int64)
+        c_ids = np.asarray(comp_tree_local.query_ball_point(p_comp, r), dtype=np.int64)
+        if len(m_ids) == 0 or len(c_ids) == 0:
+            continue
+        m_keep = np.abs((main_v[m_ids] - p_main[None, :]).dot(axis)) < (0.45 * r)
+        c_keep = np.abs((comp_v[c_ids] - p_comp[None, :]).dot(axis)) < (0.45 * r)
+        m_ids = m_ids[m_keep]
+        c_ids = c_ids[c_keep]
+        if len(m_ids) >= 12 and len(c_ids) >= 12:
+            main_seed = m_ids
+            comp_seed = c_ids
+            break
+
+    if len(main_seed) < 12 or len(comp_seed) < 12:
+        k = int(min(max(ring_vertices * 6, 72), len(main_v), len(comp_v)))
+        _, m_knn = main_tree_local.query(p_main, k=k)
+        _, c_knn = comp_tree_local.query(p_comp, k=k)
+        main_seed = np.asarray(m_knn, dtype=np.int64).reshape(-1)
+        comp_seed = np.asarray(c_knn, dtype=np.int64).reshape(-1)
+
+    ring_n = int(min(ring_vertices, len(main_seed), len(comp_seed)))
+    if ring_n < 12:
+        return trimesh.util.concatenate([main_mesh, comp_mesh]), False, gap
+
+    main_ring = _ordered_ring(main_seed, main_v, main_v[main_seed].mean(axis=0), axis, ring_n)
+    comp_ring = _ordered_ring(comp_seed, comp_v, comp_v[comp_seed].mean(axis=0), axis, ring_n)
+    if len(main_ring) != len(comp_ring) or len(main_ring) < 12:
+        return trimesh.util.concatenate([main_mesh, comp_mesh]), False, gap
+
+    m_pts = main_v[main_ring]
+    c_pts = comp_v[comp_ring]
+    shift_cost = []
+    for s in range(len(comp_ring)):
+        shift_cost.append(np.mean(np.linalg.norm(m_pts - np.roll(c_pts, s, axis=0), axis=1)))
+    comp_ring = np.roll(comp_ring, int(np.argmin(shift_cost)))
+
+    main_f = np.asarray(main_mesh.faces, dtype=np.int64)
+    comp_f = np.asarray(comp_mesh.faces, dtype=np.int64)
+    v_out = np.vstack([main_v, comp_v])
+    off = len(main_v)
+    bridge = []
+    for i in range(len(main_ring)):
+        j = (i + 1) % len(main_ring)
+        m0 = int(main_ring[i])
+        m1 = int(main_ring[j])
+        c0 = int(off + comp_ring[i])
+        c1 = int(off + comp_ring[j])
+        bridge.append([m0, c0, m1])
+        bridge.append([m1, c0, c1])
+
+    f_out = np.vstack([main_f, comp_f + off, np.asarray(bridge, dtype=np.int64)])
+    stitched = trimesh.Trimesh(vertices=v_out, faces=f_out, process=False)
+    return stitched, True, gap
+
+
+def merge_close_components(mesh, max_gap=0.28, min_faces=1200, ring_vertices=48):
+    comps = sorted(mesh.split(only_watertight=False), key=lambda x: len(x.faces), reverse=True)
+    if len(comps) <= 1:
+        return comps[0] if len(comps) == 1 else mesh
+
+    main = comps[0]
+    passthrough = []
+    merged = 0
+    for comp in comps[1:]:
+        if len(comp.faces) < min_faces:
+            passthrough.append(comp)
+            continue
+        d, _ = cKDTree(main.vertices).query(comp.vertices, k=1)
+        gap = float(np.min(d))
+        if gap > max_gap:
+            passthrough.append(comp)
+            continue
+        stitched, ok, used_gap = _stitch_components(main, comp, ring_vertices=ring_vertices)
+        if ok:
+            main = stitched
+            merged += 1
+            print(f"[poisson-merge] stitched comp faces={len(comp.faces)} gap={used_gap:.4f} m")
+        else:
+            passthrough.append(comp)
+            print(f"[poisson-merge] stitch-fallback keep comp faces={len(comp.faces)} gap={used_gap:.4f} m")
+
+    if merged == 0:
+        return keep_largest(mesh)
+    if len(passthrough) == 0:
+        return main
+    return trimesh.util.concatenate([main] + passthrough)
+
+
 def poisson(mesh, obj_path, depth=10, decimation=True):
 
     pcd_path = obj_path[:-4] + "_soups.ply"
@@ -1249,8 +1387,16 @@ def poisson(mesh, obj_path, depth=10, decimation=True):
             pcl, depth=depth, n_threads=6
         )
     os.remove(pcd_path)
-    # only keep the largest component
-    largest_mesh = keep_largest(trimesh.Trimesh(np.array(mesh.vertices), np.array(mesh.triangles)))
+    raw_mesh = trimesh.Trimesh(np.array(mesh.vertices), np.array(mesh.triangles), process=False)
+    # Permanently disabled in this fork.
+    #
+    # The close-component bridge pass was a local experiment, not upstream
+    # PSHuman behavior. It can stitch semi-transparent foreground scratches,
+    # arm-side noise, toe islands, and clothing/skin fragments into the body.
+    # Preserve largest-component behavior for production output.
+    if os.environ.get("PSHUMAN_POISSON_MERGE_COMPONENTS", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        print("[poisson-merge] requested but permanently disabled because it creates bridge artifacts")
+    largest_mesh = keep_largest(raw_mesh)
     
     if decimation:
         # mesh decimation for faster rendering

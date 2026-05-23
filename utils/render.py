@@ -47,4 +47,33 @@ class NormalsRenderer:
         if return_triangles:
             return nrm, rast_out[..., -1]
         return nrm #C,H,W,4
-            
+
+    def render_world_xyz(self,
+            vertices: torch.Tensor, #V,3 float
+            faces: torch.Tensor, #F,3 long
+            ) -> torch.Tensor: #C,H,W,4 (x_world, y_world, z_world, alpha)
+        """Rasterize per-pixel WORLD-space XYZ of the current mesh.
+
+        Used by cross-view consistency loss: the world position of a
+        surface point is identical regardless of viewing camera, so the
+        same surface point seen from two views must produce the same XYZ
+        when one view's XYZ map is reprojected into the other view's
+        image plane.
+        """
+        V = vertices.shape[0]
+        faces_i = faces.type(torch.int32)
+        vert_hom = torch.cat((vertices, torch.ones(V, 1, device=vertices.device)), dim=-1) #V,4
+        vertices_clip = vert_hom @ self._mvp.transpose(-2, -1) #C,V,4
+        rast_out, _ = dr.rasterize(self._glctx, vertices_clip, faces_i, resolution=self._image_size, grad_db=False)
+        # nvdiffrast.interpolate requires contiguous attribute tensor.
+        attr = vertices.contiguous()
+        xyz, _ = dr.interpolate(attr, rast_out, faces_i) #C,H,W,3 — world XYZ
+        alpha = torch.clamp(rast_out[..., -1:], max=1) #C,H,W,1
+        return torch.cat((xyz, alpha), dim=-1) #C,H,W,4
+
+    @property
+    def mvp(self) -> torch.Tensor:
+        """C,4,4 — concatenated proj@mv per view, exposed for cross-view ops."""
+        return self._mvp
+
+
