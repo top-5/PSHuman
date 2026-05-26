@@ -35,7 +35,16 @@ from diffusers.models.embeddings import (
     TimestepEmbedding,
     Timesteps,
 )
-from diffusers.models.modeling_utils import ModelMixin, load_state_dict, _load_state_dict_into_model
+try:
+    from diffusers.models.modeling_utils import ModelMixin, load_state_dict, _load_state_dict_into_model
+except ImportError:
+    from diffusers.models.modeling_utils import ModelMixin, load_state_dict
+
+    def _load_state_dict_into_model(model_to_load, state_dict):
+        """Shim for diffusers >= 0.30 which removed this private helper."""
+        model_to_load.load_state_dict(state_dict, strict=False)
+        return []
+
 from diffusers.models.unets.unet_2d_blocks import (
     CrossAttnDownBlock2D,
     CrossAttnUpBlock2D,
