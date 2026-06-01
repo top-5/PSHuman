@@ -39,11 +39,13 @@ try:
     from diffusers.models.modeling_utils import ModelMixin, load_state_dict, _load_state_dict_into_model
 except ImportError:
     from diffusers.models.modeling_utils import ModelMixin, load_state_dict
-
-    def _load_state_dict_into_model(model_to_load, state_dict):
-        """Shim for diffusers >= 0.30 which removed this private helper."""
-        model_to_load.load_state_dict(state_dict, strict=False)
-        return []
+    try:
+        from seed.diffusers_compat import load_state_dict_into_model_compat as _load_state_dict_into_model
+    except ImportError:
+        def _load_state_dict_into_model(model_to_load, state_dict):
+            """Shim for diffusers >= 0.30 which removed this private helper."""
+            model_to_load.load_state_dict(state_dict, strict=False)
+            return []
 
 from diffusers.models.unets.unet_2d_blocks import (
     CrossAttnDownBlock2D,
@@ -1729,4 +1731,3 @@ class UNetMV2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixi
             )
 
         return model, missing_keys, unexpected_keys, mismatched_keys, error_msgs
-

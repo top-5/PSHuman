@@ -22,7 +22,9 @@ from lib.dataset.mesh_util import apply_vertex_mask, part_removal, poisson, keep
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial import KDTree
 import argparse
+from datetime import datetime, timezone
 import json
+import pickle
 import sqlite3
 
 
@@ -102,6 +104,95 @@ def _partial_l2(param, prior):
     if n <= 0:
         return torch.zeros((), device=param.device, dtype=param.dtype)
     return ((p[:n] - q[:n]) ** 2).mean()
+
+
+def _pshuman_root():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_smplx_anatomy_ids():
+    """Load SMPL-X anatomical vertex id sets used by fit-time constraints.
+
+    These constraints are intentionally based on trusted SMPL-X/MANO metadata,
+    not on inferred mesh surgery outputs.  The ids are cached as numpy arrays
+    and converted to tensors inside the optimizer once the device/dtype is known.
+    """
+
+    root = _pshuman_root()
+    out = {}
+    mano_path = os.path.join(root, "smpl_related", "smpl_data", "MANO_SMPLX_vertex_ids.pkl")
+    if os.path.exists(mano_path):
+        with open(mano_path, "rb") as f:
+            mano = pickle.load(f)
+        out["mano_left_hand"] = np.asarray(mano.get("left_hand", []), dtype=np.int64).reshape(-1)
+        out["mano_right_hand"] = np.asarray(mano.get("right_hand", []), dtype=np.int64).reshape(-1)
+
+    partial_dir = os.path.join(root, "smpl_related", "HPS", "pymafx_data", "partial_mesh")
+    for name in ["smplx_larm_vids", "smplx_rarm_vids", "smplx_lwrist_vids", "smplx_rwrist_vids"]:
+        path = os.path.join(partial_dir, f"{name}.npz")
+        if os.path.exists(path):
+            out[name] = np.load(path)["vids"].astype(np.int64).reshape(-1)
+
+    seg_path = os.path.join(root, "smpl_related", "smpl_vert_segmentation.json")
+    if os.path.exists(seg_path):
+        with open(seg_path, "r") as f:
+            seg = json.load(f)
+        for name in ["leftFoot", "rightFoot", "leftToeBase", "rightToeBase", "leftLeg", "rightLeg"]:
+            if name in seg:
+                out[f"smplseg_{name}"] = np.asarray(seg[name], dtype=np.int64).reshape(-1)
+    return out
+
+
+def _as_index_tensor(id_sets, name, device):
+    ids = id_sets.get(name)
+    if ids is None or len(ids) == 0:
+        return None
+    return torch.as_tensor(ids, dtype=torch.long, device=device)
+
+
+def _paired_mirror_vertex_loss(vertices, left_ids, right_ids):
+    """Pointwise mirror-consistency loss for paired left/right topology ids.
+
+    This catches the exact failure mode we saw: one hand can be globally in the
+    right silhouette while its palm/fingers are rolled about 180 degrees.  A
+    silhouette term cannot see that; paired MANO ids can.
+    """
+
+    if left_ids is None or right_ids is None:
+        return torch.zeros((), device=vertices.device, dtype=vertices.dtype)
+    n = min(int(left_ids.numel()), int(right_ids.numel()))
+    if n < 16:
+        return torch.zeros((), device=vertices.device, dtype=vertices.dtype)
+    left = vertices.index_select(0, left_ids[:n])
+    right = vertices.index_select(0, right_ids[:n])
+    left = left.clone()
+    left[:, 0] = -left[:, 0]
+    left = left - left.mean(dim=0, keepdim=True)
+    right = right - right.mean(dim=0, keepdim=True)
+    return ((left - right) ** 2).mean()
+
+
+def _segment_mirror_stats_loss(vertices, left_ids, right_ids):
+    """Mirror-consistency loss for unpaired segment ids such as SMPL feet/toes."""
+
+    if left_ids is None or right_ids is None:
+        return torch.zeros((), device=vertices.device, dtype=vertices.dtype)
+    if int(left_ids.numel()) < 8 or int(right_ids.numel()) < 8:
+        return torch.zeros((), device=vertices.device, dtype=vertices.dtype)
+    left = vertices.index_select(0, left_ids)
+    right = vertices.index_select(0, right_ids)
+    left = left.clone()
+    left[:, 0] = -left[:, 0]
+    lc = left.mean(dim=0)
+    rc = right.mean(dim=0)
+    left0 = left - lc
+    right0 = right - rc
+    cov_l = left0.T @ left0 / max(int(left0.shape[0]) - 1, 1)
+    cov_r = right0.T @ right0 / max(int(right0.shape[0]) - 1, 1)
+    # Centroid plus covariance keeps symmetric foot/toe segments from rolling
+    # into incompatible outside/upside-down shapes without requiring a fake
+    # point correspondence.
+    return ((lc - rc) ** 2).mean() + 0.25 * ((cov_l - cov_r) ** 2).mean()
 
 
 def _env_int_set(name, default):
@@ -585,7 +676,7 @@ class ReMesh:
         # Default weights now bias toward Front/Back (1.0) and downweight pure
         # sides (0.6) and quarter views (0.4). Override with PSHUMAN_VIEW_WEIGHTS
         # as a comma-separated list of 6 floats matching `self.views` ordering.
-        default_w = [1.0, 0.4, 0.6, 1.0, 0.6, 0.4]
+        default_w = [1.0, 0.4, 0.8, 1.0, 0.8, 0.4]
         env_w = os.environ.get("PSHUMAN_VIEW_WEIGHTS", "").strip()
         if env_w:
             try:
@@ -913,8 +1004,24 @@ class ReMesh:
             return masks, target_normals
         with torch.no_grad():
             v = v_smpl.detach()
-            n = calc_vertex_normals(v, self.smplx_face)
-            rendered = self.renderer.render(v, self.smplx_face, normals=n)
+            # Exclude head vertices from the prior silhouette.  SMPL-X uses a
+            # smooth sphere for the skull which has a different profile from real
+            # hair, so injecting it into side views creates a mohawk / blob.
+            # Strategy: drop any face whose highest vertex sits above the neck.
+            # "Highest" = largest value on the dominant vertical axis (the axis
+            # with the greatest peak-to-peak range across all vertices).
+            ranges = v.max(dim=0).values - v.min(dim=0).values  # (3,)
+            up_axis = int(ranges.argmax().item())               # 0=X,1=Y,2=Z
+            v_up = v[:, up_axis]
+            v_up_min, v_up_max = float(v_up.min()), float(v_up.max())
+            body_height = v_up_max - v_up_min
+            # Neck ≈ top 18 % of body height; clip head by dropping faces above.
+            neck_cutoff = v_up_min + 0.82 * body_height
+            face_vert_up = v_up[self.smplx_face]               # [F,3]
+            body_face_mask = face_vert_up.max(dim=-1).values < neck_cutoff
+            body_faces = self.smplx_face[body_face_mask]
+            n = calc_vertex_normals(v, body_faces)
+            rendered = self.renderer.render(v, body_faces, normals=n)
         prior_alpha = rendered[..., 3:]            # [V,H,W,1]
         prior_normals = rendered[..., :3]          # [V,H,W,3]
         strength = float(max(0.0, min(1.0, self.xview_strength)))
@@ -1051,6 +1158,12 @@ class ReMesh:
         smpl_prior_pose_l2 = _env_float("PSHUMAN_SMPL_PRIOR_POSE_L2", _env_float("PSHUMAN_SMPL_PRIOR_POSE_WEIGHT", 0.0))
         smpl_prior_orient_l2 = _env_float("PSHUMAN_SMPL_PRIOR_ORIENT_L2", _env_float("PSHUMAN_SMPL_PRIOR_ORIENT_WEIGHT", 0.0))
         smpl_prior_trans_l2 = _env_float("PSHUMAN_SMPL_PRIOR_TRANS_L2", _env_float("PSHUMAN_SMPL_PRIOR_TRANS_WEIGHT", 0.0))
+        smpl_anatomy_weight = _env_float("PSHUMAN_SMPL_ANATOMY_WEIGHT", 0.0)
+        smpl_symmetry_weight = _env_float("PSHUMAN_SMPL_SYMMETRY_WEIGHT", smpl_anatomy_weight)
+        smpl_hand_symmetry_weight = _env_float("PSHUMAN_SMPL_HAND_SYMMETRY_WEIGHT", smpl_symmetry_weight)
+        smpl_arm_symmetry_weight = _env_float("PSHUMAN_SMPL_ARM_SYMMETRY_WEIGHT", smpl_symmetry_weight)
+        smpl_foot_symmetry_weight = _env_float("PSHUMAN_SMPL_FOOT_SYMMETRY_WEIGHT", smpl_symmetry_weight)
+        smpl_toe_symmetry_weight = _env_float("PSHUMAN_SMPL_TOE_SYMMETRY_WEIGHT", smpl_foot_symmetry_weight)
         smpl_freeze_head_neck = _env_bool("PSHUMAN_SMPL_FREEZE_HEAD_NECK", False)
         smpl_head_neck_joint_spec = os.environ.get("PSHUMAN_SMPL_HEAD_NECK_JOINTS", "11,14")
         smpl_head_neck_joints = []
@@ -1069,6 +1182,11 @@ class ReMesh:
         smpl_active_betas = _env_int("PSHUMAN_SMPL_ACTIVE_BETAS", int(optimed_betas.shape[-1]))
         smpl_active_betas = max(0, min(int(smpl_active_betas), int(optimed_betas.shape[-1])))
         smpl_save_fit = _env_bool("PSHUMAN_SMPL_SAVE_FIT", True)
+        smpl_anatomy_ids_np = _load_smplx_anatomy_ids()
+        smpl_anatomy_ids = {
+            name: _as_index_tensor(smpl_anatomy_ids_np, name, self.device)
+            for name in smpl_anatomy_ids_np
+        }
 
         beta_initial = optimed_betas.detach().clone()
         pose_initial = optimed_pose.detach().clone()
@@ -1092,7 +1210,6 @@ class ReMesh:
             optimizer_smpl,
             mode="min",
             factor=0.5,
-            verbose=0,
             min_lr=1e-5,
             patience=5,
         )
@@ -1133,6 +1250,25 @@ class ReMesh:
                 "prior_pose_l2": float(smpl_prior_pose_l2),
                 "prior_orient_l2": float(smpl_prior_orient_l2),
                 "prior_trans_l2": float(smpl_prior_trans_l2),
+                "anatomy": float(smpl_anatomy_weight),
+                "symmetry": float(smpl_symmetry_weight),
+                "hand_symmetry": float(smpl_hand_symmetry_weight),
+                "arm_symmetry": float(smpl_arm_symmetry_weight),
+                "foot_symmetry": float(smpl_foot_symmetry_weight),
+                "toe_symmetry": float(smpl_toe_symmetry_weight),
+            },
+            "anatomy_constraints": {
+                "enabled": bool(
+                    smpl_anatomy_weight > 0
+                    or smpl_symmetry_weight > 0
+                    or smpl_hand_symmetry_weight > 0
+                    or smpl_arm_symmetry_weight > 0
+                    or smpl_foot_symmetry_weight > 0
+                    or smpl_toe_symmetry_weight > 0
+                ),
+                "contract": "seed.pshuman_smplx_fit_anatomy_constraints.v1",
+                "principle": "Prefer trusted SMPL-X/MANO left-right anatomical symmetry; reject 180-degree palm/toe roll by loss and post-fit gate.",
+                "id_sets": {k: int(len(v)) for k, v in smpl_anatomy_ids_np.items()},
             },
             "head_neck": {
                 "freeze": bool(smpl_freeze_head_neck),
@@ -1223,6 +1359,39 @@ class ReMesh:
                 smpl_prior_pose_loss = torch.zeros((), device=self.device, dtype=optimed_pose.dtype)
                 smpl_prior_orient_loss = torch.zeros((), device=self.device, dtype=optimed_pose.dtype)
                 smpl_prior_trans_loss = torch.zeros((), device=self.device, dtype=optimed_pose.dtype)
+            smpl_hand_symmetry_loss = _paired_mirror_vertex_loss(
+                v_smpl,
+                smpl_anatomy_ids.get("mano_left_hand"),
+                smpl_anatomy_ids.get("mano_right_hand"),
+            )
+            smpl_arm_symmetry_loss = (
+                _paired_mirror_vertex_loss(
+                    v_smpl,
+                    smpl_anatomy_ids.get("smplx_larm_vids"),
+                    smpl_anatomy_ids.get("smplx_rarm_vids"),
+                )
+                + _paired_mirror_vertex_loss(
+                    v_smpl,
+                    smpl_anatomy_ids.get("smplx_lwrist_vids"),
+                    smpl_anatomy_ids.get("smplx_rwrist_vids"),
+                )
+            ) * 0.5
+            smpl_foot_symmetry_loss = _segment_mirror_stats_loss(
+                v_smpl,
+                smpl_anatomy_ids.get("smplseg_leftFoot"),
+                smpl_anatomy_ids.get("smplseg_rightFoot"),
+            )
+            smpl_toe_symmetry_loss = _segment_mirror_stats_loss(
+                v_smpl,
+                smpl_anatomy_ids.get("smplseg_leftToeBase"),
+                smpl_anatomy_ids.get("smplseg_rightToeBase"),
+            )
+            smpl_anatomy_loss = (
+                smpl_hand_symmetry_weight * smpl_hand_symmetry_loss
+                + smpl_arm_symmetry_weight * smpl_arm_symmetry_loss
+                + smpl_foot_symmetry_weight * smpl_foot_symmetry_loss
+                + smpl_toe_symmetry_weight * smpl_toe_symmetry_loss
+            )
 
             smpl_loss = (
                 smpl_mask_weight * smpl_mask_loss
@@ -1236,6 +1405,7 @@ class ReMesh:
                 + smpl_prior_pose_l2 * smpl_prior_pose_loss
                 + smpl_prior_orient_l2 * smpl_prior_orient_loss
                 + smpl_prior_trans_l2 * smpl_prior_trans_loss
+                + smpl_anatomy_loss
             )
             # smpl_loss =  smpl_mask_loss 
             smpl_loss.backward()
@@ -1280,6 +1450,11 @@ class ReMesh:
                     "prior_pose_l2": float(smpl_prior_pose_loss.detach().cpu()),
                     "prior_orient_l2": float(smpl_prior_orient_loss.detach().cpu()),
                     "prior_trans_l2": float(smpl_prior_trans_loss.detach().cpu()),
+                    "anatomy_loss": float(smpl_anatomy_loss.detach().cpu()),
+                    "hand_symmetry_loss": float(smpl_hand_symmetry_loss.detach().cpu()),
+                    "arm_symmetry_loss": float(smpl_arm_symmetry_loss.detach().cpu()),
+                    "foot_symmetry_loss": float(smpl_foot_symmetry_loss.detach().cpu()),
+                    "toe_symmetry_loss": float(smpl_toe_symmetry_loss.detach().cpu()),
                     "front_silhouette_iou": front_sil["iou"],
                     "mean_silhouette_iou": float(np.mean(per_view_iou)),
                     "beta_norm": float(torch.linalg.norm(optimed_betas.detach()).cpu()),
@@ -1328,6 +1503,33 @@ class ReMesh:
             with torch.no_grad():
                 fit_normals = calc_vertex_normals(v_smpl, self.smplx_face)
                 fit_render = self.renderer.render(v_smpl, self.smplx_face, normals=fit_normals)
+                final_hand_symmetry_loss = _paired_mirror_vertex_loss(
+                    v_smpl,
+                    smpl_anatomy_ids.get("mano_left_hand"),
+                    smpl_anatomy_ids.get("mano_right_hand"),
+                )
+                final_arm_symmetry_loss = (
+                    _paired_mirror_vertex_loss(
+                        v_smpl,
+                        smpl_anatomy_ids.get("smplx_larm_vids"),
+                        smpl_anatomy_ids.get("smplx_rarm_vids"),
+                    )
+                    + _paired_mirror_vertex_loss(
+                        v_smpl,
+                        smpl_anatomy_ids.get("smplx_lwrist_vids"),
+                        smpl_anatomy_ids.get("smplx_rwrist_vids"),
+                    )
+                ) * 0.5
+                final_foot_symmetry_loss = _segment_mirror_stats_loss(
+                    v_smpl,
+                    smpl_anatomy_ids.get("smplseg_leftFoot"),
+                    smpl_anatomy_ids.get("smplseg_rightFoot"),
+                )
+                final_toe_symmetry_loss = _segment_mirror_stats_loss(
+                    v_smpl,
+                    smpl_anatomy_ids.get("smplseg_leftToeBase"),
+                    smpl_anatomy_ids.get("smplseg_rightToeBase"),
+                )
             per_view_silhouette = {}
             for vi, view_name in enumerate(self.views[: int(masks.shape[0])]):
                 per_view_silhouette[view_name] = _silhouette_fit_metrics(
@@ -1360,28 +1562,74 @@ class ReMesh:
                     "mean_bbox_iou": mean_silhouette_bbox_iou,
                     "per_view": per_view_silhouette,
                 },
+                "anatomy_constraints": {
+                    "contract": "seed.pshuman_smplx_fit_anatomy_constraints.v1",
+                    "enabled": smpl_fit_config["anatomy_constraints"]["enabled"],
+                    "final_losses": {
+                        "hand_symmetry_loss": float(final_hand_symmetry_loss.detach().cpu()),
+                        "arm_symmetry_loss": float(final_arm_symmetry_loss.detach().cpu()),
+                        "foot_symmetry_loss": float(final_foot_symmetry_loss.detach().cpu()),
+                        "toe_symmetry_loss": float(final_toe_symmetry_loss.detach().cpu()),
+                    },
+                    "weights": {
+                        "hand_symmetry": float(smpl_hand_symmetry_weight),
+                        "arm_symmetry": float(smpl_arm_symmetry_weight),
+                        "foot_symmetry": float(smpl_foot_symmetry_weight),
+                        "toe_symmetry": float(smpl_toe_symmetry_weight),
+                    },
+                    "policy": "If post-fit anatomical validation fails, do not graft; refit or search parameters instead.",
+                },
             }
-            with open(f'{smpl_fit_dir}/fit_report.json', 'w') as f:
+            attempt_tag = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            attempt_tag = f"{attempt_tag}_steps{int(smpl_steps)}_betas{int(smpl_active_betas)}"
+            attempt_dir = os.path.join(smpl_fit_dir, "attempts", attempt_tag)
+            os.makedirs(attempt_dir, exist_ok=True)
+
+            canonical_report_path = f'{smpl_fit_dir}/fit_report.json'
+            canonical_overlay_path = f'{smpl_fit_dir}/front_silhouette_fit_overlay.png'
+            canonical_params_path = f'{smpl_fit_dir}/smplx_fit_params.npz'
+            canonical_mesh_path = f'{smpl_fit_dir}/smplx_fit_mesh.obj'
+            attempt_report_path = os.path.join(attempt_dir, "fit_report.json")
+            attempt_overlay_path = os.path.join(attempt_dir, "front_silhouette_fit_overlay.png")
+            attempt_params_path = os.path.join(attempt_dir, "smplx_fit_params.npz")
+            attempt_mesh_path = os.path.join(attempt_dir, "smplx_fit_mesh.obj")
+
+            final_summary["artifacts"] = {
+                "attempt_dir": attempt_dir,
+                "report_json": attempt_report_path,
+                "front_silhouette_fit_overlay": attempt_overlay_path,
+                "params_path": attempt_params_path,
+                "mesh_path": attempt_mesh_path,
+                "canonical_report_json": canonical_report_path,
+                "canonical_params_path": canonical_params_path,
+                "canonical_mesh_path": canonical_mesh_path,
+            }
+            with open(canonical_report_path, 'w') as f:
+                json.dump(final_summary, f, indent=2)
+            with open(attempt_report_path, 'w') as f:
                 json.dump(final_summary, f, indent=2)
             try:
                 import imageio
                 overlay = _silhouette_overlay_rgb(fit_render[0, ..., 3:], masks[0])
-                imageio.imwrite(f'{smpl_fit_dir}/front_silhouette_fit_overlay.png', overlay)
+                imageio.imwrite(canonical_overlay_path, overlay)
+                imageio.imwrite(attempt_overlay_path, overlay)
             except Exception as exc:
                 print(f"[smpl-fit] silhouette overlay write failed: {exc}", flush=True)
-            np.savez_compressed(
-                f'{smpl_fit_dir}/smplx_fit_params.npz',
-                betas=_tensor_np(optimed_betas),
-                betas_initial=_tensor_np(beta_initial),
-                trans=_tensor_np(optimed_trans),
-                global_orient_6d=_tensor_np(optimed_orient),
-                body_pose_6d=_tensor_np(optimed_pose),
-                left_hand_pose=_tensor_np(optimed_lhand),
-                right_hand_pose=_tensor_np(optimed_rhand),
-                v_smpl=_tensor_np(v_smpl),
-                faces=_tensor_np(self.smplx_face),
-            )
-            save_mesh(f'{smpl_fit_dir}/smplx_fit_mesh.obj', v_smpl.detach().cpu().numpy(), self.smplx_face.detach().cpu().numpy())
+            smpl_fit_npz = {
+                "betas": _tensor_np(optimed_betas),
+                "betas_initial": _tensor_np(beta_initial),
+                "trans": _tensor_np(optimed_trans),
+                "global_orient_6d": _tensor_np(optimed_orient),
+                "body_pose_6d": _tensor_np(optimed_pose),
+                "left_hand_pose": _tensor_np(optimed_lhand),
+                "right_hand_pose": _tensor_np(optimed_rhand),
+                "v_smpl": _tensor_np(v_smpl),
+                "faces": _tensor_np(self.smplx_face),
+            }
+            np.savez_compressed(canonical_params_path, **smpl_fit_npz)
+            np.savez_compressed(attempt_params_path, **smpl_fit_npz)
+            save_mesh(canonical_mesh_path, v_smpl.detach().cpu().numpy(), self.smplx_face.detach().cpu().numpy())
+            save_mesh(attempt_mesh_path, v_smpl.detach().cpu().numpy(), self.smplx_face.detach().cpu().numpy())
             sqlite_path = os.environ.get("PSHUMAN_SMPL_SQLITE", f'{smpl_fit_dir}/smpl_fit_attempts.sqlite')
             try:
                 conn = sqlite3.connect(sqlite_path)
@@ -1403,6 +1651,8 @@ class ReMesh:
                         mean_silhouette_iou REAL NOT NULL DEFAULT 0,
                         beta_norm REAL NOT NULL,
                         beta_delta_max REAL NOT NULL,
+                        attempt_dir TEXT NOT NULL DEFAULT '',
+                        overlay_path TEXT NOT NULL DEFAULT '',
                         report_json TEXT NOT NULL,
                         params_path TEXT NOT NULL,
                         mesh_path TEXT NOT NULL,
@@ -1413,6 +1663,8 @@ class ReMesh:
                 for col in [
                     ("front_silhouette_iou", "REAL NOT NULL DEFAULT 0"),
                     ("mean_silhouette_iou", "REAL NOT NULL DEFAULT 0"),
+                    ("attempt_dir", "TEXT NOT NULL DEFAULT ''"),
+                    ("overlay_path", "TEXT NOT NULL DEFAULT ''"),
                 ]:
                     try:
                         conn.execute(f"ALTER TABLE smpl_fit_attempts ADD COLUMN {col[0]} {col[1]}")
@@ -1424,8 +1676,9 @@ class ReMesh:
                         case_name, steps, active_betas, beta_lr, pose_lr, trans_lr,
                         mask_weight, normal_weight, beta_l2, beta_clamp,
                         front_silhouette_iou, mean_silhouette_iou,
-                        beta_norm, beta_delta_max, report_json, params_path, mesh_path
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        beta_norm, beta_delta_max, attempt_dir, overlay_path,
+                        report_json, params_path, mesh_path
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         case,
@@ -1442,9 +1695,11 @@ class ReMesh:
                         final_summary["final"]["mean_silhouette_iou"],
                         final_summary["final"]["beta_norm"],
                         final_summary["final"]["beta_delta_max"],
-                        f'{smpl_fit_dir}/fit_report.json',
-                        f'{smpl_fit_dir}/smplx_fit_params.npz',
-                        f'{smpl_fit_dir}/smplx_fit_mesh.obj',
+                        attempt_dir,
+                        attempt_overlay_path,
+                        attempt_report_path,
+                        attempt_params_path,
+                        attempt_mesh_path,
                     ),
                 )
                 conn.commit()

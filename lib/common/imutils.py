@@ -1,7 +1,12 @@
 import os
 os.environ["OPENCV_IO_ENABLE_OPENEXR"]="1"
 import cv2
-import mediapipe as mp
+try:
+    import mediapipe as mp
+    _MP_SOLUTIONS_AVAILABLE = hasattr(mp, 'solutions')
+except ImportError:
+    mp = None
+    _MP_SOLUTIONS_AVAILABLE = False
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -81,6 +86,18 @@ def get_keypoints(image):
             all_lmks.append(torch.Tensor([lmk[i].x, lmk[i].y, lmk[i].z, visibility]))
         return torch.stack(all_lmks).view(-1, 4)
 
+    fake_kps = torch.zeros(33, 4)
+
+    if not _MP_SOLUTIONS_AVAILABLE:
+        # mediapipe >= 0.10 dropped the solutions API; return empty keypoints
+        # PIXIE/HPS estimator handles body estimation independently
+        result = {}
+        result["body"] = fake_kps
+        result["lhand"] = fake_kps
+        result["rhand"] = fake_kps
+        result["face"] = fake_kps
+        return result
+
     mp_holistic = mp.solutions.holistic
 
     with mp_holistic.Holistic(
@@ -88,8 +105,6 @@ def get_keypoints(image):
         model_complexity=2,
     ) as holistic:
         results = holistic.process(image)
-
-    fake_kps = torch.zeros(33, 4)
 
     result = {}
     result["body"] = collect_xyv(results.pose_landmarks) if results.pose_landmarks else fake_kps
