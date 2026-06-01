@@ -327,8 +327,9 @@ class SingleImageDataset(Dataset):
             # This puts the real back-photo VAE latents into the back-view denoising,
             # eliminating the bun hallucination that occurs when the front photo
             # (which carries hair signal in its VAE latents) is used for the back view.
-            # Side views (indices 2, 4) still use front photo; noise_level in the
-            # pipeline config smears the hair signal for those views.
+            # Side view index 2 uses front photo; index 4 uses back_image (= front
+            # in single_image mode; actual back photo in multi-image mode).
+            # noise_level in the pipeline config smears the hair signal for side views.
             cond_views = [image, image, image, back_image, back_image, image]
             img_tensors_in = [tmp.permute(2, 0, 1) for tmp in cond_views] + [
                 self.all_faces[index%len(self.all_images)].permute(2, 0, 1)
