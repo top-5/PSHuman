@@ -694,8 +694,10 @@ class ReMesh:
         # smplx_silhouette   : OR the fitted SMPL-X silhouette into side-view
         #                      masks so the optimizer cannot drop limbs the prior
         #                      says exist (fixes parallel-pancake wrist).
-        # Default: smplx_silhouette
-        self.xview_mode = os.environ.get("PSHUMAN_XVIEW_MODE", "smplx_silhouette").strip().lower()
+        # Default: off — smplx_silhouette caused front/back bulge when SMPL-X
+        # arm joints were poorly initialized (zero mediapipe keypoints) and the
+        # resulting wider depth profile was injected into NeuS masks.
+        self.xview_mode = os.environ.get("PSHUMAN_XVIEW_MODE", "off").strip().lower()
         # Which view indices receive prior-silhouette injection. Defaults to the
         # pure side views (right=2, left=4) since front/back come from the
         # actual photo and should not be overridden.
@@ -1146,6 +1148,11 @@ class ReMesh:
         smpl_pose_lr = _env_float("PSHUMAN_SMPL_POSE_LR", 3e-3)
         smpl_orient_lr = _env_float("PSHUMAN_SMPL_ORIENT_LR", 3e-3)
         smpl_trans_lr = _env_float("PSHUMAN_SMPL_TRANS_LR", 3e-3)
+        # Freeze global orient so hard-symmetry constraint cannot be absorbed by
+        # tilting the whole body to match a slightly asymmetric silhouette.
+        smpl_freeze_orient = _env_bool("PSHUMAN_SMPL_FREEZE_GLOBAL_ORIENT", False)
+        if smpl_freeze_orient:
+            optimed_orient.requires_grad_(False)
         smpl_beta_l2 = _env_float("PSHUMAN_SMPL_BETA_L2", 0.0)
         smpl_beta_clamp = _env_float("PSHUMAN_SMPL_BETA_CLAMP", 0.0)
         smpl_mask_weight = _env_float("PSHUMAN_SMPL_MASK_WEIGHT", 1.0)
@@ -1165,6 +1172,13 @@ class ReMesh:
         smpl_foot_symmetry_weight = _env_float("PSHUMAN_SMPL_FOOT_SYMMETRY_WEIGHT", smpl_symmetry_weight)
         smpl_toe_symmetry_weight = _env_float("PSHUMAN_SMPL_TOE_SYMMETRY_WEIGHT", smpl_foot_symmetry_weight)
         smpl_freeze_head_neck = _env_bool("PSHUMAN_SMPL_FREEZE_HEAD_NECK", False)
+        # Hard bilateral symmetry projection (default ON). Operates directly on
+        # body_pose 6D after each optimizer step using the same mirror map as
+        # seed.smplx_iterfit.symmetry — averages left and mirror(right), writes
+        # the symmetric pair back. Sign pattern for 6D mirror across YZ plane:
+        # [r1,r2] = [a,b,c, d,e,f] -> [a,-b,-c, -d,e,f]. Pairs are 0-indexed
+        # into the 21-joint body_pose.
+        smpl_hard_symmetry = _env_bool("PSHUMAN_SMPL_HARD_SYMMETRY", True)
         smpl_head_neck_joint_spec = os.environ.get("PSHUMAN_SMPL_HEAD_NECK_JOINTS", "11,14")
         smpl_head_neck_joints = []
         try:
@@ -1188,6 +1202,43 @@ class ReMesh:
             for name in smpl_anatomy_ids_np
         }
 
+        # Local 6D bilateral symmetry projection — mirror plane = YZ in SMPL-X
+        # model space (M = diag(-1,1,1), so R' = M·R·M).
+        #
+        # CRITICAL: ``utils.mesh_utils.rot6d_to_rotmat`` does ``x.view(-1, 3, 2)``
+        # on a contiguous (B,6) tensor, which is row-major. So the 6D layout is
+        # *interleaved* — [r00, r01, r10, r11, r20, r21] (pairs of (col0, col1)
+        # per row), NOT the column-major [r00, r10, r20, r01, r11, r21]. The
+        # mirror sign must follow the interleaved layout, otherwise four of the
+        # six components flip the wrong way, Gram-Schmidt rebuilds a garbage
+        # rotation, and the projection scrambles the pose every step.
+        # Pairs are 0-indexed into the 21-joint body_pose.
+        _SYMMETRY_PAIRS_6D = (
+            (0, 1), (3, 4), (6, 7), (9, 10),
+            (12, 13), (15, 16), (17, 18), (19, 20),
+        )
+
+        def _project_body_pose_symmetric(pose_tensor: torch.Tensor) -> None:
+            """In-place project body_pose 6D to bilaterally symmetric subspace."""
+            pose_flat = pose_tensor.view(-1, 6)
+            # Interleaved layout: signs for [r00, r01, r10, r11, r20, r21]
+            # under R' = diag(-1,1,1) · R · diag(-1,1,1).
+            sign = torch.tensor(
+                [1.0, -1.0, -1.0, 1.0, -1.0, 1.0],
+                device=pose_flat.device,
+                dtype=pose_flat.dtype,
+            )
+            for li, ri in _SYMMETRY_PAIRS_6D:
+                left = pose_flat[li].clone()
+                right = pose_flat[ri].clone()
+                sym_left = (left + right * sign) * 0.5
+                pose_flat[li] = sym_left
+                pose_flat[ri] = sym_left * sign
+
+        if smpl_hard_symmetry:
+            with torch.no_grad():
+                _project_body_pose_symmetric(optimed_pose)
+
         beta_initial = optimed_betas.detach().clone()
         pose_initial = optimed_pose.detach().clone()
         lhand_initial = optimed_lhand.detach().clone()
@@ -1199,9 +1250,10 @@ class ReMesh:
             {'params': [optimed_lhand, optimed_rhand], 'lr': smpl_hand_lr, 'name': 'hands'},
             {'params': [optimed_betas], 'lr': smpl_beta_lr, 'name': 'betas'},
             {'params': [optimed_pose], 'lr': smpl_pose_lr, 'name': 'body_pose'},
-            {'params': [optimed_orient], 'lr': smpl_orient_lr, 'name': 'global_orient'},
             {'params': [optimed_trans], 'lr': smpl_trans_lr, 'name': 'trans'},
         ]
+        if not smpl_freeze_orient:
+            optimed_params.append({'params': [optimed_orient], 'lr': smpl_orient_lr, 'name': 'global_orient'})
         optimizer_smpl = torch.optim.Adam(
             optimed_params,
             amsgrad=True,
@@ -1238,6 +1290,7 @@ class ReMesh:
             },
             "reset_hands": bool(smpl_reset_hands),
             "freeze_hands": bool(smpl_freeze_hands),
+            "freeze_orient": bool(smpl_freeze_orient),
             "weights": {
                 "mask": float(smpl_mask_weight),
                 "normal": float(smpl_normal_weight),
@@ -1276,6 +1329,7 @@ class ReMesh:
                 "joint_index_space": "body_pose_6d_zero_based",
             },
             "beta_clamp": float(smpl_beta_clamp),
+            "hard_symmetry": bool(smpl_hard_symmetry),
             "prior": {
                 "path": smpl_prior["path"] if smpl_prior is not None else "",
                 "init_from_prior": bool(smpl_init_from_prior),
@@ -1420,6 +1474,9 @@ class ReMesh:
             if optimed_betas.grad is not None and smpl_active_betas < optimed_betas.shape[-1]:
                 optimed_betas.grad[..., smpl_active_betas:] = 0
             optimizer_smpl.step()
+            if smpl_hard_symmetry:
+                with torch.no_grad():
+                    _project_body_pose_symmetric(optimed_pose)
             if smpl_freeze_head_neck and smpl_head_neck_joints:
                 with torch.no_grad():
                     pose_flat = optimed_pose.view(-1, 6)
