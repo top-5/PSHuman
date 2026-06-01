@@ -11,6 +11,12 @@ from einops import rearrange, repeat
 import math
 
 import torch.nn.functional as F
+try:
+    from seed.diffusers_compat import diffusers_attention_kwargs_compat
+except ImportError:
+    def diffusers_attention_kwargs_compat(**kwargs):
+        return kwargs
+
 if is_xformers_available():
     import xformers
     import xformers.ops
@@ -318,7 +324,15 @@ class IPCrossAttn(Attention):
 
     def __init__(self,  
             query_dim, cross_attention_dim, heads, dim_head, dropout, bias, upcast_attention, ip_scale=1.0):
-        super().__init__(query_dim, cross_attention_dim, heads, dim_head, dropout, bias, upcast_attention)
+        super().__init__(**diffusers_attention_kwargs_compat(
+            query_dim=query_dim,
+            cross_attention_dim=cross_attention_dim,
+            heads=heads,
+            dim_head=dim_head,
+            dropout=dropout,
+            bias=bias,
+            upcast_attention=upcast_attention,
+        ))
 
         self.ip_scale = ip_scale
         # self.num_tokens = num_tokens

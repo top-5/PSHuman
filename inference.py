@@ -553,11 +553,13 @@ def load_pshuman_pipeline(cfg):
         cfg.pretrained_model_name_or_path,
         subfolder="unet",
         torch_dtype=weight_dtype,
+        local_files_only=True,
     )
     pipeline = StableUnCLIPImg2ImgPipeline.from_pretrained(
         cfg.pretrained_model_name_or_path,
         unet=unet,
         torch_dtype=weight_dtype,
+        local_files_only=True,
     )
     pipeline.unet.enable_xformers_memory_efficient_attention()
     if hasattr(pipeline, 'enable_vae_slicing'):
