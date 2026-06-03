@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 from typing import Dict, Optional, Tuple, List
 from omegaconf import OmegaConf
 from PIL import Image
@@ -108,6 +109,18 @@ class TestConfig:
     # upper-right quadrant of the front normal map.  This can corrupt shoulders
     # and elbows when the close-up tile is not registered to the full body.
     front_normal_face_patch: bool = True
+    # Real-ESRGAN x4 super-resolution applied to the 6 colour + 6 normal views
+    # between diffusion and ``ReMesh.preprocess``.  Runs in the seed venv via
+    # a subprocess (PSHuman conda env doesn't have basicsr/realesrgan).
+    # ReMesh.preprocess will then bilinear-resize to ``recon_opt.resolution``,
+    # so raising both together (e.g. SR to 1536 and recon resolution 1536)
+    # actually delivers extra texture detail.
+    mv_color_upscale: bool = False
+    mv_normal_upscale: bool = True   # gated by mv_color_upscale
+    mv_upscale_final_size: int = 1536  # 0 = keep native SR size (4x)
+    mv_upscale_python: Optional[str] = None
+    mv_upscale_script: Optional[str] = None
+    mv_upscale_ckpt: Optional[str] = None
 
 
 # ── DepthPro normals blend helper ──────────────────────────────────────────
@@ -220,6 +233,83 @@ def _blend_depthpro_normals(
 
     print(f'[depthpro-blend] done — {total_replaced} px replaced across '
           f'{len(mv_views)} views', flush=True)
+
+
+def _upscale_mv_views(
+    colors: List,
+    normals: List,
+    mv_views: List[str],
+    cfg,
+) -> None:
+    """Real-ESRGAN x4 SR on the colour (and optionally normal) views.
+
+    Runs in seed's venv via subprocess. The PSHuman conda env doesn't have
+    basicsr/realesrgan. Each PIL image is written to a temp dir, SR script
+    upscales them in batch, results are loaded back in place of the
+    originals. RGBA is preserved (alpha is upscaled via the base.py split/merge
+    path inside the upscaler).
+    """
+    py = getattr(cfg, 'mv_upscale_python', None) or '/workspace/seed/.venv/bin/python3'
+    script = getattr(cfg, 'mv_upscale_script', None) or '/workspace/seed/scripts/realesrgan_mv_views.py'
+    ckpt = getattr(cfg, 'mv_upscale_ckpt', None)
+    final_size = int(getattr(cfg, 'mv_upscale_final_size', 0) or 0)
+    do_normals = bool(getattr(cfg, 'mv_normal_upscale', True))
+
+    if not os.path.exists(py) or not os.path.exists(script):
+        print(f'[mv-upscale] skipped: py={py} exists={os.path.exists(py)} '
+              f'script={script} exists={os.path.exists(script)}', flush=True)
+        return
+
+    with tempfile.TemporaryDirectory() as tdir:
+        in_dir  = os.path.join(tdir, 'in')
+        out_dir = os.path.join(tdir, 'out')
+        os.makedirs(in_dir, exist_ok=True)
+        os.makedirs(out_dir, exist_ok=True)
+        manifest = []  # (kind, vi, name)
+        for vi, view in enumerate(mv_views):
+            cname = f'c_{vi:02d}_{view}.png'
+            colors[vi].save(os.path.join(in_dir, cname))
+            manifest.append(('color', vi, cname))
+            if do_normals:
+                nname = f'n_{vi:02d}_{view}.png'
+                normals[vi].save(os.path.join(in_dir, nname))
+                manifest.append(('normal', vi, nname))
+
+        cmd = [
+            py, script,
+            '--output-dir', out_dir,
+            '--final-size', str(final_size),
+            '--device', 'cuda',
+        ]
+        if ckpt:
+            cmd += ['--ckpt', ckpt]
+        for _, _, name in manifest:
+            cmd += ['--input', os.path.join(in_dir, name)]
+        try:
+            result = subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+            if result.stderr:
+                sys.stdout.write(result.stderr.decode())
+                sys.stdout.flush()
+        except subprocess.CalledProcessError as e:
+            print(f'[mv-upscale] failed: rc={e.returncode}', flush=True)
+            if e.stderr:
+                sys.stdout.write(e.stderr.decode())
+            return
+
+        for kind, vi, name in manifest:
+            out_path = os.path.join(out_dir, name)
+            if not os.path.exists(out_path):
+                print(f'[mv-upscale] missing output: {name}', flush=True)
+                continue
+            sr = Image.open(out_path).convert('RGBA')
+            if kind == 'color':
+                colors[vi] = sr
+            else:
+                normals[vi] = sr
+
+    fsz = final_size if final_size > 0 else '4x'
+    print(f'[mv-upscale] done — {len(mv_views)} colour views'
+          f"{' + normals' if do_normals else ''} -> {fsz}px", flush=True)
 
 
 def convert_to_numpy(tensor):
@@ -537,6 +627,10 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                     # ── DepthPro confidence-blend on diffusion normals ────────
                     if cfg.depthpro_normals_blend:
                         _blend_depthpro_normals(colors, normals, MV_VIEWS, cfg)
+
+                    # ── Real-ESRGAN x4 SR on colour (and optionally normal) views ─
+                    if cfg.mv_color_upscale:
+                        _upscale_mv_views(colors, normals, MV_VIEWS, cfg)
 
                     # ---------------- MV-DUMP: save the carving inputs ----------
                     if cfg.mv_dump_dir:
