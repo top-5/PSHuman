@@ -691,12 +691,18 @@ class ReMesh:
         print(f"[reconstruct] view weights = {default_w}", flush=True)
         # ---- cross-view prior mode --------------------------------------------
         # off                : original behaviour (no mask augmentation)
-        # smplx_silhouette   : OR the fitted SMPL-X silhouette into side-view
-        #                      masks so the optimizer cannot drop limbs the prior
-        #                      says exist (fixes parallel-pancake wrist).
-        # Default: off — smplx_silhouette caused front/back bulge when SMPL-X
-        # arm joints were poorly initialized (zero mediapipe keypoints) and the
-        # resulting wider depth profile was injected into NeuS masks.
+        # smplx_silhouette   : OR the initial HPS SMPL-X silhouette (A-pose,
+        #                      before the optimizer runs) into side-view masks
+        #                      and normals so the optimizer cannot drop limbs
+        #                      the prior says exist.
+        #
+        # The prior is now sourced from v_smpl_init (initial HPS estimate,
+        # A-pose arms correct) not from the final v_smpl.  The old behaviour
+        # injected the *final* fitted v_smpl which often had arms pulled in by
+        # inconsistent natural-pose side-view masks, making injection useless.
+        # The old front/back bulge warning applies only if the initial HPS
+        # arm pose is severely wrong (e.g. zero mediapipe keypoints). That is
+        # uncommon; test smpl_fit/init_iter000.png to verify before enabling.
         self.xview_mode = os.environ.get("PSHUMAN_XVIEW_MODE", "off").strip().lower()
         # Which view indices receive prior-silhouette injection. Defaults to the
         # pure side views (right=2, left=4) since front/back come from the
@@ -1342,6 +1348,64 @@ class ReMesh:
             with open(f'{smpl_fit_dir}/fit_config.json', 'w') as f:
                 json.dump(smpl_fit_config, f, indent=2)
 
+        # Pre-compute the initial SMPL-X mesh (HPS pose, before any optimizer step).
+        #
+        # This serves two purposes:
+        #   1. It sets `scale` and `offset` before the loop so the
+        #      `if scale is None:` guard inside the loop is always False —
+        #      identical numerical behaviour, but v_smpl_init is available
+        #      after the block.
+        #   2. When xview_mode == "smplx_silhouette": inject the A-pose arm
+        #      silhouettes into the side-view masks/normals BEFORE the
+        #      optimizer runs, so the 250-step SMPL-X fit never sees the
+        #      "arms-at-hip" side-view targets that pull arms downward.
+        #
+        # Root cause of the arm-pancake artifact (verified on alena-bikini):
+        #   - The PSHuman diffusion model generates side views (right, left) in
+        #     natural standing pose (arm hanging at hip level), while front and
+        #     back views show the correct A-pose (arms extended).
+        #   - The SMPL-X optimizer receives contradictory mask supervision and
+        #     finds a loss-minimising compromise: it pulls the initially-correct
+        #     A-pose arms (visible in smpl_fit/init_iter000.png) progressively
+        #     downward over 250 steps (visible in smpl_fit/final_iter250.png).
+        #   - _inject_prior_silhouette is then called with this *compromised*
+        #     final v_smpl, so it injects a wrong (arms-down) silhouette into
+        #     the side views — making things *worse*, not better.
+        #
+        # Fix:
+        #   - Capture v_smpl_init (A-pose, correct arms) from the initial HPS
+        #     estimate and inject it into side-view masks BEFORE the SMPL-X
+        #     fit loop.  The optimizer now sees consistent A-pose masks from all
+        #     six views and preserves the arm geometry.
+        #   - Reuse v_smpl_init for the post-loop injection (MeshOptimizer).
+        with torch.no_grad():
+            _pre_orient_mat = rot6d_to_rotmat(optimed_orient.detach().view(-1, 6)).unsqueeze(0)
+            _pre_pose_mat   = rot6d_to_rotmat(optimed_pose.detach().view(-1, 6)).unsqueeze(0)
+            _pre_verts, _, _ = self.econ_dataset.smpl_model(
+                shape_params=optimed_betas,
+                expression_params=tensor2variable(pose["exp"], self.device),
+                body_pose=_pre_pose_mat,
+                global_pose=_pre_orient_mat,
+                jaw_pose=tensor2variable(pose["jaw_pose"], self.device),
+                left_hand_pose=optimed_lhand,
+                right_hand_pose=optimed_rhand,
+            )
+            _pre_verts = _pre_verts + optimed_trans
+            v_smpl_init = torch.matmul(torch.matmul(_pre_verts.squeeze(0), rz.T), ry.T)
+            scale, offset = scale_mesh(v_smpl_init)
+            v_smpl_init = (v_smpl_init + offset) * scale * 2
+
+        if self.xview_mode == "smplx_silhouette":
+            # Inject A-pose prior into side-view masks BEFORE the SMPL-X fit.
+            # v_smpl_init has correct arm positions; the final v_smpl may not.
+            print("[smpl-fit] pre-loop silhouette injection from v_smpl_init (A-pose arms)", flush=True)
+            masks, target_normals = self._inject_prior_silhouette(
+                masks, target_normals, v_smpl_init, case_path=case_path
+            )
+            # Rebuild the SMPL fit loss mask with the augmented masks so the
+            # newly-injected arm pixels are treated like regular foreground.
+            smpl_fit_loss_mask, _ = self._build_smpl_fit_loss_mask(masks, case_path)
+
         for i in tqdm(range(smpl_steps)):
             optimizer_smpl.zero_grad()
             # 6d_rot to rot_mat
@@ -1766,8 +1830,19 @@ class ReMesh:
 
         # Cross-view prior: inject SMPL-X silhouette into side-view masks.
         # See _inject_prior_silhouette docstring. No-op when PSHUMAN_XVIEW_MODE=off.
+        #
+        # Use v_smpl_init (initial HPS A-pose, correct arm positions) instead of
+        # the final v_smpl when in smplx_silhouette mode.  The final v_smpl will
+        # have had its arms pulled downward by the side-view natural-pose masks
+        # during the SMPL-X fit, making it useless (or harmful) as a prior.
+        # v_smpl_init is pre-computed above, before the optimization loop.
+        _inject_v = (
+            v_smpl_init
+            if self.xview_mode == "smplx_silhouette"
+            else v_smpl.detach()
+        )
         masks, target_normals = self._inject_prior_silhouette(
-            masks, target_normals, v_smpl.detach(), case_path=case_path
+            masks, target_normals, _inject_v, case_path=case_path
         )
 
         nrm_opt = MeshOptimizer(v_smpl.detach(), self.smplx_face.detach(), edge_len_lims=[0.01, 0.1])
