@@ -1988,14 +1988,33 @@ class ReMesh:
                 faces=self.smplx_face.detach().cpu().numpy(),
             )
             seg_path = os.path.join(_pshuman_root(), "smpl_related", "smpl_vert_segmentation.json")
-            with open(seg_path, "r") as _f:
-                _seg = json.load(_f)
+            partial_dir = os.path.join(_pshuman_root(), "smpl_related", "HPS", "pymafx_data", "partial_mesh")
+            mano_path = os.path.join(_pshuman_root(), "smpl_related", "smpl_data", "MANO_SMPLX_vertex_ids.pkl")
             _arm_ids: list[int] = []
-            for _seg_name in [
-                "leftShoulder", "leftArm", "leftForeArm", "leftHand", "leftHandIndex1",
-                "rightShoulder", "rightArm", "rightForeArm", "rightHand", "rightHandIndex1",
+            # Use SMPL-X partial mesh vertex IDs (not smpl_vert_segmentation.json
+            # which contains SMPL vertex IDs and only covers ~50% of the right arm
+            # in the target-frame SMPL-X mesh).
+            for _npz_name in [
+                "smplx_larm_vids", "smplx_rarm_vids",
+                "smplx_lwrist_vids", "smplx_rwrist_vids",
+                "smplx_lhand_vids", "smplx_rhand_vids",
+                "smplx_forearm_vids",
             ]:
-                _arm_ids.extend(_seg.get(_seg_name, []))
+                _npz = os.path.join(partial_dir, f"{_npz_name}.npz")
+                if os.path.exists(_npz):
+                    _arm_ids.extend(int(v) for v in np.load(_npz)["vids"])
+            # Add MANO hand vertices for full hand coverage.
+            if os.path.exists(mano_path):
+                with open(mano_path, "rb") as _f:
+                    _mano = pickle.load(_f)
+                for _k in ("left_hand", "right_hand"):
+                    _arm_ids.extend(int(v) for v in _mano.get(_k, []))
+            # Fallback: smpl_vert_segmentation shoulder entries for shoulder seam.
+            if os.path.exists(seg_path):
+                with open(seg_path, "r") as _f:
+                    _seg = json.load(_f)
+                for _seg_name in ["leftShoulder", "rightShoulder"]:
+                    _arm_ids.extend(_seg.get(_seg_name, []))
             _arm_ids = sorted(set(_arm_ids))
             arm_mask = torch.zeros(smpl_data.smplx_verts.shape[0])
             arm_mask[torch.tensor(_arm_ids, dtype=torch.long)] = 1.0
