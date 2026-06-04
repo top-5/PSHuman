@@ -1828,22 +1828,36 @@ class ReMesh:
             except Exception as exc:
                 print(f"[smpl-fit] sqlite logging failed: {exc}", flush=True)
 
-        # Cross-view prior: inject SMPL-X silhouette into side-view masks.
-        # See _inject_prior_silhouette docstring. No-op when PSHUMAN_XVIEW_MODE=off.
+        # Cross-view prior for the MeshOptimizer: intentionally SKIPPED when
+        # xview_mode == "smplx_silhouette".
         #
-        # Use v_smpl_init (initial HPS A-pose, correct arm positions) instead of
-        # the final v_smpl when in smplx_silhouette mode.  The final v_smpl will
-        # have had its arms pulled downward by the side-view natural-pose masks
-        # during the SMPL-X fit, making it useless (or harmful) as a prior.
-        # v_smpl_init is pre-computed above, before the optimization loop.
-        _inject_v = (
-            v_smpl_init
-            if self.xview_mode == "smplx_silhouette"
-            else v_smpl.detach()
-        )
-        masks, target_normals = self._inject_prior_silhouette(
-            masks, target_normals, _inject_v, case_path=case_path
-        )
+        # Rationale:
+        #   The pre-loop injection above already fixed the SMPL-X fit (arms are
+        #   correctly preserved in v_smpl / v_smpl_init).  For the MeshOptimizer
+        #   the injection does more harm than good:
+        #
+        #   - PSHuman diffusion generates side views in natural standing pose
+        #     (arms at hip level), so the side-view image data contains zero arm
+        #     normal information.
+        #   - Injecting an A-pose arm silhouette tells the MeshOptimizer "there
+        #     should be geometry here" but there are no matching normals in the
+        #     front/back views to support it.
+        #   - The optimizer satisfies the constraint by pushing body DEPTH (Z)
+        #     outward → large front/back bulge in the remeshed OBJ.  Poisson
+        #     then collapses the inconsistent geometry → arms still absent,
+        #     but now the torso has a permanent depth distortion.
+        #
+        #   The correct architecture: MeshOptimizer follows real diffusion views
+        #   faithfully (natural-pose body, no arms).  Arms are supplied by the
+        #   wrist graft stage which uses the SMPL-X donor mesh (which DOES have
+        #   correct A-pose arms thanks to the pre-loop injection).
+        #
+        #   The post-loop injection is only useful in the original "off" mode
+        #   where no pre-loop injection ran, and even then it was fragile.
+        if self.xview_mode != "smplx_silhouette":
+            masks, target_normals = self._inject_prior_silhouette(
+                masks, target_normals, v_smpl.detach(), case_path=case_path
+            )
 
         nrm_opt = MeshOptimizer(v_smpl.detach(), self.smplx_face.detach(), edge_len_lims=[0.01, 0.1])
         vertices, faces = nrm_opt.vertices, nrm_opt.faces
