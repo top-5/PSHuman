@@ -1960,9 +1960,61 @@ class ReMesh:
                 flush=True,
             )
 
-        #### replace hand
+        #### replace arms from SMPL-X init mesh when xview_mode=smplx_silhouette
+        # The MeshOptimizer collapses arm geometry because the diffusion side
+        # views show natural pose (arms at hip) — there is no arm normal data in
+        # any view that would keep arms extended. The solution: after the
+        # optimizer produces a clean body mesh, carve out the arm stumps and
+        # replace them with the A-pose SMPL-X arm geometry from v_smpl_init.
+        #
+        # Arm segments to replace (from smpl_vert_segmentation.json):
+        #   leftArm, leftForeArm, leftHand, leftHandIndex1,
+        #   rightArm, rightForeArm, rightHand, rightHandIndex1
+        # plus leftShoulder/rightShoulder so the seam starts at the shoulder.
+        #
+        # Controlled by env: PSHUMAN_REPLACE_ARMS (default 1 in smplx_silhouette mode)
+        _replace_arms = (
+            self.xview_mode == "smplx_silhouette"
+            and _env_bool("PSHUMAN_REPLACE_ARMS", True)
+        )
+
+        #### replace hand (original logic, still active when arms not replaced)
         smpl_data = SMPLX()
-        if self.opt.replace_hand  and True in pose['hands_visibility'][0]:
+        if _replace_arms:
+            # Use mesh_smpl_init (A-pose) as arm donor — not the post-optimizer
+            # mesh_smpl which may have had its arms pulled by the side views.
+            mesh_smpl_init = trimesh.Trimesh(
+                vertices=v_smpl_init.detach().cpu().numpy(),
+                faces=self.smplx_face.detach().cpu().numpy(),
+            )
+            seg_path = os.path.join(_pshuman_root(), "smpl_related", "smpl_vert_segmentation.json")
+            with open(seg_path, "r") as _f:
+                _seg = json.load(_f)
+            _arm_ids: list[int] = []
+            for _seg_name in [
+                "leftShoulder", "leftArm", "leftForeArm", "leftHand", "leftHandIndex1",
+                "rightShoulder", "rightArm", "rightForeArm", "rightHand", "rightHandIndex1",
+            ]:
+                _arm_ids.extend(_seg.get(_seg_name, []))
+            _arm_ids = sorted(set(_arm_ids))
+            arm_mask = torch.zeros(smpl_data.smplx_verts.shape[0])
+            arm_mask[torch.tensor(_arm_ids, dtype=torch.long)] = 1.0
+            arm_mesh = apply_vertex_mask(mesh_smpl_init.copy(), arm_mask)
+            body_mesh = part_removal(
+                mesh_remeshed.copy(),
+                arm_mesh,
+                0.06,
+                self.device,
+                mesh_smpl_init.copy(),
+                region="arm",
+            )
+            final = poisson(sum([arm_mesh, body_mesh]), f'{case_path}/{case}_final.obj', 10, False)
+            print(
+                f"[reconstruct] arm replacement: donor={len(arm_mesh.vertices)} verts  "
+                f"body={len(body_mesh.vertices)} verts  merged={len(final.vertices)} verts",
+                flush=True,
+            )
+        elif self.opt.replace_hand and True in pose['hands_visibility'][0]:
             hand_mask = torch.zeros(smpl_data.smplx_verts.shape[0], )
             if pose['hands_visibility'][0][0]:
                 hand_mask.index_fill_(
