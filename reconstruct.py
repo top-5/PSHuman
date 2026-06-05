@@ -2007,7 +2007,7 @@ class ReMesh:
         #
         # Also pre-compute constants for the arm-depth regularizer used inside
         # the MeshOptimizer loop below.
-        slab_arm_depth_w = _env_float("PSHUMAN_SLAB_ARM_DEPTH_W", 0.0)
+        slab_arm_depth_w = _env_float("PSHUMAN_SLAB_ARM_DEPTH_W", 0.0)  # disabled by default
         slab_body_x_half = 0.0
         slab_arm_x_max   = 0.0
         slab_target_arm_half_depth = 0.0
@@ -2062,8 +2062,10 @@ class ReMesh:
             # Target arm half-depth: default 35% of body half-depth
             _arm_depth_frac = _env_float("PSHUMAN_SLAB_ARM_DEPTH_FRAC", 0.35)
             slab_target_arm_half_depth = _body_z_half * _arm_depth_frac
-            # Default weight for arm depth regularizer
-            slab_arm_depth_w = _env_float("PSHUMAN_SLAB_ARM_DEPTH_W", 0.15)
+            # Default weight for arm depth regularizer (0 = disabled by default)
+            # The normalized-space v_smpl_init Z doesn't match post-Poisson body Z,
+            # so non-zero weight shrinks arm X span. Enable only with careful tuning.
+            slab_arm_depth_w = _env_float("PSHUMAN_SLAB_ARM_DEPTH_W", 0.0)
             print(
                 f"[slab-init] arm depth regularizer: body_x_half={slab_body_x_half:.3f} "
                 f"arm_x_max={slab_arm_x_max:.3f} body_z_half={_body_z_half:.3f} "
