@@ -1398,6 +1398,12 @@ class ReMesh:
         if self.xview_mode == "smplx_silhouette":
             # Inject A-pose prior into side-view masks BEFORE the SMPL-X fit.
             # v_smpl_init has correct arm positions; the final v_smpl may not.
+            # Save original masks first — the MeshOptimizer must use the ORIGINAL
+            # diffusion masks (no arm injection), not the arm-augmented ones.
+            # The pre-loop injection only helps the SMPL-X fit; after the fit
+            # loop we restore the originals so the body mesh is not distorted.
+            masks_original = masks.clone()
+            target_normals_original = target_normals.clone()
             print("[smpl-fit] pre-loop silhouette injection from v_smpl_init (A-pose arms)", flush=True)
             masks, target_normals = self._inject_prior_silhouette(
                 masks, target_normals, v_smpl_init, case_path=case_path
@@ -1858,6 +1864,15 @@ class ReMesh:
             masks, target_normals = self._inject_prior_silhouette(
                 masks, target_normals, v_smpl.detach(), case_path=case_path
             )
+        else:
+            # Restore the ORIGINAL (un-injected) masks for the MeshOptimizer.
+            # The arm-augmented masks were only needed for the SMPL-X fit loop.
+            # Giving the MeshOptimizer arm-augmented side-view masks causes it
+            # to expand body depth to match the injected arm silhouettes, which
+            # produces the chest/leg bulge artifact. The body mesh must be built
+            # from real diffusion views only (natural pose, no arms).
+            masks = masks_original
+            target_normals = target_normals_original
 
         nrm_opt = MeshOptimizer(v_smpl.detach(), self.smplx_face.detach(), edge_len_lims=[0.01, 0.1])
         vertices, faces = nrm_opt.vertices, nrm_opt.faces
