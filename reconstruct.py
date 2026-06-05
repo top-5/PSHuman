@@ -662,6 +662,7 @@ def _silhouette_slab_mesh(
     device: torch.device,
     simplify_contour: bool = True,
     epsilon: float = 0.01,
+    symmetrize: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build a thin bilaterally-extruded slab from the front-view alpha mask.
 
@@ -696,6 +697,15 @@ def _silhouette_slab_mesh(
         mask_np = mask_np[..., 0]
     mask_u8 = (mask_np * 255).clip(0, 255).astype(np.uint8)
     h, w = mask_u8.shape
+
+    # When the subject pose is bilaterally symmetric, symmetrize the mask by
+    # averaging the left half with its mirror — this gives the MeshOptimizer
+    # a perfectly symmetric slab starting point that the asymmetric oblique
+    # views cannot easily break.
+    if symmetrize:
+        flipped = mask_u8[:, ::-1].copy()
+        mask_u8 = np.maximum(mask_u8, flipped)
+        print("[slab-init] symmetrized front mask", flush=True)
 
     # --- binary threshold + find the largest outer contour ---
     _, binary = cv2.threshold(mask_u8, 64, 255, cv2.THRESH_BINARY)
@@ -2008,11 +2018,15 @@ class ReMesh:
             slab_half_depth = _env_float("PSHUMAN_SLAB_HALF_DEPTH", z_range * 0.5)
             # Front-view mask is view index 0 in the masks tensor (V, H, W, 1)
             front_mask = masks_original[0] if self.xview_mode == "smplx_silhouette" else masks[0]
+            # Symmetrize the slab when pose is detected as symmetric (default on).
+            # Reads PSHUMAN_SLAB_SYMMETRIZE=1|0; default 1.
+            slab_symmetrize = _env_bool("PSHUMAN_SLAB_SYMMETRIZE", True)
             slab_v, slab_f = _silhouette_slab_mesh(
                 front_mask,
                 ortho_scale=ortho_scale,
                 half_depth=slab_half_depth,
                 device=self.device,
+                symmetrize=slab_symmetrize,
             )
             nrm_opt = MeshOptimizer(slab_v, slab_f, edge_len_lims=[0.01, 0.1])
         vertices, faces = nrm_opt.vertices, nrm_opt.faces
