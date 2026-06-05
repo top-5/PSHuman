@@ -653,6 +653,122 @@ def save_mesh(save_name, vertices, faces,  color=None):
         faces_np,
         vertex_colors=color_np) \
     .export(save_name)
+
+
+def _silhouette_slab_mesh(
+    front_mask: torch.Tensor,
+    ortho_scale: float,
+    half_depth: float,
+    device: torch.device,
+    simplify_contour: bool = True,
+    epsilon: float = 0.01,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a thin bilaterally-extruded slab from the front-view alpha mask.
+
+    The MeshOptimizer normally starts from a 3D SMPL-X mesh.  When the diffusion
+    side-views show natural-pose arms but the SMPL-X is in A-pose, the side-view
+    loss destroys the A-pose arm geometry over 700+ iterations.
+
+    This alternative initializer extrudes the front silhouette into a thin slab:
+    - Front face  (z = +half_depth)  — faithfully contains A-pose arm shape
+    - Back face   (z = -half_depth)  — mirror of front
+    - Side walls  connecting the two faces
+    - The slab is a single connected, watertight mesh
+
+    The side-view alpha loss can only *shrink* the slab depth, it cannot
+    disconnect arm geometry — solving the arm-collapse problem.
+
+    Args:
+        front_mask: (H, W) or (H, W, 1) alpha mask tensor, values in [0,1].
+        ortho_scale: orthographic camera half-width (opt.scale / 2).
+        half_depth: half-thickness of the slab in normalised mesh units.
+        device: torch device.
+        simplify_contour: apply Douglas-Peucker contour simplification.
+        epsilon: DP simplification tolerance (normalised units).
+
+    Returns:
+        (vertices, faces) torch tensors in the same normalised space as v_smpl.
+    """
+    import cv2
+
+    mask_np = front_mask.detach().cpu().numpy()
+    if mask_np.ndim == 3:
+        mask_np = mask_np[..., 0]
+    mask_u8 = (mask_np * 255).clip(0, 255).astype(np.uint8)
+    h, w = mask_u8.shape
+
+    # --- binary threshold + find the largest outer contour ---
+    _, binary = cv2.threshold(mask_u8, 64, 255, cv2.THRESH_BINARY)
+    # fill small holes so the silhouette is solid
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        # fallback: return a unit box
+        v = torch.tensor([[-1,-1,-1],[-1,1,-1],[1,1,-1],[1,-1,-1],
+                          [-1,-1,1],[-1,1,1],[1,1,1],[1,-1,1]], dtype=torch.float32, device=device) * 0.5
+        f = torch.tensor([[0,1,2],[0,2,3],[4,5,6],[4,6,7],[0,4,7],[0,7,3],
+                          [1,5,6],[1,6,2],[0,1,5],[0,5,4],[3,2,6],[3,6,7]], dtype=torch.long, device=device)
+        return v, f
+
+    contour = max(contours, key=cv2.contourArea)
+    # simplify
+    if simplify_contour:
+        eps_px = max(2, int(epsilon * min(h, w)))
+        contour = cv2.approxPolyDP(contour, eps_px, closed=True)
+    pts2d = contour.reshape(-1, 2).astype(np.float64)
+
+    # --- unproject 2D pixel coords → 3D normalised mesh space ---
+    # PSHuman renderer ortho: pixel x in [0,W] maps to [-ortho_scale, ortho_scale]
+    # pixel y in [0,H] maps to [+ortho_scale, -ortho_scale]  (y-down → y-up)
+    def px_to_xyz(pts, z):
+        x3d = (pts[:, 0] / w) * 2 * ortho_scale - ortho_scale
+        y3d = ortho_scale - (pts[:, 1] / h) * 2 * ortho_scale
+        z3d = np.full(len(pts), z)
+        return np.stack([x3d, y3d, z3d], axis=1)
+
+    front_pts = px_to_xyz(pts2d, +half_depth)   # shape (N, 3)
+    back_pts  = px_to_xyz(pts2d, -half_depth)   # shape (N, 3)
+    n = len(pts2d)
+
+    all_verts = np.vstack([front_pts, back_pts])  # (2N, 3)
+
+    # --- triangulate the front polygon face (fan from centroid) ---
+    front_faces = []
+    c_front = np.mean(front_pts, axis=0)
+    c_back  = np.mean(back_pts,  axis=0)
+    c_front_idx = 2 * n
+    c_back_idx  = 2 * n + 1
+    all_verts = np.vstack([all_verts, c_front[None], c_back[None]])
+
+    for i in range(n):
+        j = (i + 1) % n
+        # front face (ccw when viewed from +z)
+        front_faces.append([c_front_idx, i, j])
+        # back face (ccw when viewed from -z → reverse winding)
+        back_faces_app = [c_back_idx, n + j, n + i]
+        front_faces.append(back_faces_app)
+
+    # --- side wall quads as two triangles ---
+    side_faces = []
+    for i in range(n):
+        j = (i + 1) % n
+        # quad: front[i], back[i], back[j], front[j]
+        side_faces.append([i,     n + i, n + j])
+        side_faces.append([i,     n + j, j     ])
+
+    all_faces = np.array(front_faces + side_faces, dtype=np.int64)
+
+    # --- convert to torch ---
+    verts_t = torch.as_tensor(all_verts, dtype=torch.float32, device=device)
+    faces_t = torch.as_tensor(all_faces, dtype=torch.long, device=device)
+    print(
+        f"[slab-init] built slab from front silhouette: "
+        f"verts={len(all_verts)} faces={len(all_faces)} "
+        f"half_depth={half_depth:.4f} ortho_scale={ortho_scale:.2f}",
+        flush=True,
+    )
+    return verts_t, faces_t
         
 
     
@@ -1875,6 +1991,30 @@ class ReMesh:
             target_normals = target_normals_original
 
         nrm_opt = MeshOptimizer(v_smpl.detach(), self.smplx_face.detach(), edge_len_lims=[0.01, 0.1])
+        # ------------------------------------------------------------------
+        # Optional: replace the SMPL-X mesh initializer with a front-silhouette
+        # slab.  Enabled via PSHUMAN_SLAB_INIT=1.
+        #
+        # Rationale: when diffusion side views show natural-pose arms (arm at
+        # hip) but the SMPL-X is in A-pose, the side-view alpha loss destroys
+        # arm geometry over 700+ iterations.  A thin slab extruded from the
+        # FRONT silhouette starts connected (no floating arm cylinders), so the
+        # side-view loss can only *shrink* its depth — it cannot disconnect arms.
+        if _env_bool("PSHUMAN_SLAB_INIT", False):
+            ortho_scale = float(self.opt.scale) / 2.0  # matches make_sparse_camera
+            # Use Z range of v_smpl_init as the slab thickness (natural body depth)
+            v_init_np = v_smpl_init.detach().cpu().numpy()
+            z_range = float(v_init_np[:, 2].max() - v_init_np[:, 2].min())
+            slab_half_depth = _env_float("PSHUMAN_SLAB_HALF_DEPTH", z_range * 0.5)
+            # Front-view mask is view index 0 in the masks tensor (V, H, W, 1)
+            front_mask = masks_original[0] if self.xview_mode == "smplx_silhouette" else masks[0]
+            slab_v, slab_f = _silhouette_slab_mesh(
+                front_mask,
+                ortho_scale=ortho_scale,
+                half_depth=slab_half_depth,
+                device=self.device,
+            )
+            nrm_opt = MeshOptimizer(slab_v, slab_f, edge_len_lims=[0.01, 0.1])
         vertices, faces = nrm_opt.vertices, nrm_opt.faces
 
         # ---- synthetic acceptance check for cross-view depth loss ------------
