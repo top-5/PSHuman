@@ -2005,6 +2005,13 @@ class ReMesh:
         # Optional: replace the SMPL-X mesh initializer with a front-silhouette
         # slab.  Enabled via PSHUMAN_SLAB_INIT=1.
         #
+        # Also pre-compute constants for the arm-depth regularizer used inside
+        # the MeshOptimizer loop below.
+        slab_arm_depth_w = _env_float("PSHUMAN_SLAB_ARM_DEPTH_W", 0.0)
+        slab_body_x_half = 0.0
+        slab_arm_x_max   = 0.0
+        slab_target_arm_half_depth = 0.0
+        #
         # Rationale: when diffusion side views show natural-pose arms (arm at
         # hip) but the SMPL-X is in A-pose, the side-view alpha loss destroys
         # arm geometry over 700+ iterations.  A thin slab extruded from the
@@ -2029,6 +2036,40 @@ class ReMesh:
                 symmetrize=slab_symmetrize,
             )
             nrm_opt = MeshOptimizer(slab_v, slab_f, edge_len_lims=[0.01, 0.1])
+            # Set arm depth regularizer constants for the MeshOptimizer loop.
+            # body_x_half: X position where body ends and arm starts (approx)
+            # arm_x_max:   X extent of the slab arm tip
+            # target half-depth = body_half_depth * frac (from body Z range of SMPL-X)
+            _v_np = v_smpl_init.detach().cpu().numpy()
+            _body_verts_np = _v_np[np.abs(_v_np[:, 0]) < 0.2]
+            _body_z_half = float((_body_verts_np[:, 2].max() - _body_verts_np[:, 2].min()) * 0.5) if len(_body_verts_np) > 100 else 0.3
+            # Body lateral half-width from SMPL-X shoulder
+            _shoulder_ids = []
+            try:
+                import json as _json
+                _seg_path = os.path.join(_pshuman_root(), "smpl_related", "smpl_vert_segmentation.json")
+                with open(_seg_path) as _f:
+                    _seg = _json.load(_f)
+                _shoulder_ids = _seg.get("leftShoulder", []) + _seg.get("rightShoulder", [])
+            except Exception:
+                pass
+            if _shoulder_ids:
+                _sh_v = _v_np[[i for i in _shoulder_ids if i < len(_v_np)]]
+                slab_body_x_half = float(np.abs(_sh_v[:, 0]).mean()) if len(_sh_v) else 0.35
+            else:
+                slab_body_x_half = 0.35
+            slab_arm_x_max = float(np.abs(_v_np[:, 0]).max())
+            # Target arm half-depth: default 35% of body half-depth
+            _arm_depth_frac = _env_float("PSHUMAN_SLAB_ARM_DEPTH_FRAC", 0.35)
+            slab_target_arm_half_depth = _body_z_half * _arm_depth_frac
+            # Default weight for arm depth regularizer
+            slab_arm_depth_w = _env_float("PSHUMAN_SLAB_ARM_DEPTH_W", 0.15)
+            print(
+                f"[slab-init] arm depth regularizer: body_x_half={slab_body_x_half:.3f} "
+                f"arm_x_max={slab_arm_x_max:.3f} body_z_half={_body_z_half:.3f} "
+                f"target_arm_half_depth={slab_target_arm_half_depth:.4f} w={slab_arm_depth_w}",
+                flush=True,
+            )
         vertices, faces = nrm_opt.vertices, nrm_opt.faces
 
         # ---- synthetic acceptance check for cross-view depth loss ------------
@@ -2087,6 +2128,23 @@ class ReMesh:
                 loss = loss + self.xview_depth_w * xview_loss
                 if self.debug_dump_normals and (i % max(1, self.debug_dump_every) == 0):
                     print(f"[xview-depth] iter {i:04d}  L_xview={float(xview_loss.item()):.5f}", flush=True)
+
+            # Arm-depth regularizer for slab init mode.
+            # The side-view alpha loss drives arm depth (Z) toward zero.
+            # We counteract this by penalizing arm vertices that are closer to
+            # Z=0 (the slab center) than a reference body depth fraction.
+            # Uses the absolute Z range of v_smpl_init (body center) as the
+            # reference: the arm target half-depth = body_Z_half * frac.
+            if _env_bool("PSHUMAN_SLAB_INIT", False) and slab_arm_depth_w > 0:
+                v_cur = vertices  # (N, 3)
+                abs_x = v_cur[:, 0].abs()
+                # Only penalise vertices in the lateral arm zone
+                arm_zone = (abs_x > slab_body_x_half) & (abs_x < slab_arm_x_max * 0.95)
+                if arm_zone.sum() > 64:
+                    z_arm = v_cur[arm_zone, 2]
+                    # Penalise when |z| < target_half_depth (hinge on 0 when satisfied)
+                    arm_depth_loss = torch.clamp(slab_target_arm_half_depth - z_arm.abs(), min=0.0).mean()
+                    loss = loss + slab_arm_depth_w * arm_depth_loss
 
             loss.backward()
             
