@@ -2154,65 +2154,6 @@ class ReMesh:
             final = poisson(sum([hand_mesh, body_mesh]), f'{case_path}/{case}_final.obj', 10, False)
         else:
             final = poisson(mesh_remeshed, f'{case_path}/{case}_final.obj', 10, False)
-
-        # Slab post-processing: inflate arm depth so the shoulder junction
-        # looks connected from the top view.
-        #
-        # Problem: the side-view alpha loss drives arm depth toward ~0 (side
-        # views show no arm in natural/A-pose). Body depth stays at ~0.64m
-        # (front/back constrain it). The shoulder transition looks like a gap
-        # from the top view.
-        #
-        # Fix: after Poisson, for each vertex in the arm-body transition zone,
-        # compute the local body depth at the same Y level from the body center,
-        # then lerp the arm vertex Z outward to ~30% of the body depth.
-        # This gives a smooth visual transition without distorting silhouette.
-        if _env_bool("PSHUMAN_SLAB_INIT", False) and _env_bool("PSHUMAN_SLAB_ARM_INFLATE", True):
-            _verts = np.asarray(final.vertices, dtype=np.float64)
-            _faces = np.asarray(final.faces, dtype=np.int64)
-            # Find body-center depth (Z span at X~0, representative of "full" depth)
-            _body_mask = np.abs(_verts[:, 0]) < 0.2
-            if _body_mask.sum() > 100:
-                _body_z = _verts[_body_mask, 2]
-                _body_half_depth = float((_body_z.max() - _body_z.min()) * 0.5)
-                _body_z_center = float((_body_z.max() + _body_z.min()) * 0.5)
-            else:
-                _body_half_depth = 0.3
-                _body_z_center = 0.0
-            # X extent of the body (where the transition begins)
-            _body_x_half = float(np.percentile(np.abs(_verts[:, 0]), 60))
-            # X extent of the arm tips
-            _arm_x_max = float(np.abs(_verts[:, 0]).max())
-            # Target arm depth fraction of body depth
-            _arm_depth_frac = _env_float("PSHUMAN_SLAB_ARM_DEPTH_FRAC", 0.22)
-            # For each vertex in the arm transition zone, inflate Z toward body center
-            _abs_x = np.abs(_verts[:, 0])
-            # Transition: linear from 0 (at body edge) to 1 (at body_x_half)
-            _t = np.clip((_abs_x - _body_x_half) / max(_arm_x_max - _body_x_half, 0.01), 0.0, 1.0)
-            # Target Z half-depth at each point: lerp from body_half_depth to arm_half_depth
-            _arm_half_depth = _body_half_depth * _arm_depth_frac
-            _target_half = _body_half_depth * (1 - _t) + _arm_half_depth * _t
-            # Current signed Z relative to body center
-            _z_rel = _verts[:, 2] - _body_z_center
-            _z_abs = np.abs(_z_rel)
-            # Only inflate vertices that are thinner than the target (don't squash the body)
-            _inflate_mask = _t > 0.05  # only in arm region
-            _current_half = np.where(_inflate_mask, _z_abs, _target_half)
-            _inflate_needed = (_target_half > _current_half) & _inflate_mask
-            if _inflate_needed.sum() > 0:
-                # Scale Z to match target half-depth
-                _scale = np.where(
-                    _inflate_needed & (_z_abs > 1e-4),
-                    _target_half / np.maximum(_z_abs, 1e-4),
-                    1.0,
-                )
-                _verts[:, 2] = _body_z_center + _z_rel * _scale
-                final = trimesh.Trimesh(vertices=_verts, faces=_faces, process=False)
-                print(
-                    f"[slab-arm-inflate] inflated arm verts: {_inflate_needed.sum()} "
-                    f"body_half_depth={_body_half_depth:.3f}m target_arm={_arm_half_depth:.3f}m",
-                    flush=True,
-                )
         vertices = torch.from_numpy(final.vertices).float().to(self.device)
         faces = torch.from_numpy(final.faces).long().to(self.device)
         # Differing from paper, we use the texturing method in Unique3D
