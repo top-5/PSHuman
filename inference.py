@@ -121,6 +121,8 @@ class TestConfig:
     mv_upscale_python: Optional[str] = None
     mv_upscale_script: Optional[str] = None
     mv_upscale_ckpt: Optional[str] = None
+    bald_head_filter_image: Optional[str] = None
+    bald_head_filter_views: str = "back"
 
 
 # ── DepthPro normals blend helper ──────────────────────────────────────────
@@ -233,6 +235,186 @@ def _blend_depthpro_normals(
 
     print(f'[depthpro-blend] done — {total_replaced} px replaced across '
           f'{len(mv_views)} views', flush=True)
+
+
+def _alpha_bbox(alpha):
+    import numpy as np
+
+    ys, xs = np.where(alpha > 10)
+    if xs.size < 100:
+        h, w = alpha.shape[:2]
+        return 0, 0, w, h
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def _preprocess_rgba_to_pshuman_canvas(path: str, image_size: int, crop_size: int):
+    import numpy as np
+
+    im = Image.open(path).convert('RGBA')
+    alpha = np.asarray(im)[:, :, 3]
+    if alpha.max() == 255 and alpha.min() == 255:
+        im = remove(im.convert('RGB'), session=session).convert('RGBA')
+        alpha = np.asarray(im)[:, :, 3]
+    x0, y0, x1, y1 = _alpha_bbox(alpha)
+    im = im.crop((x0, y0, x1, y1))
+    src_w, src_h = im.size
+    scale = crop_size / max(src_h, src_w)
+    im = im.resize((max(1, int(round(src_w * scale))), max(1, int(round(src_h * scale)))), Image.BILINEAR)
+    canvas = Image.new('RGBA', (image_size, image_size), (0, 0, 0, 0))
+    canvas.paste(im, ((image_size - im.width) // 2, (image_size - im.height) // 2))
+    return canvas
+
+
+def _skin_rgb_from_rgba(arr, alpha, fallback=(214, 170, 140)):
+    import numpy as np
+
+    x0, y0, x1, y1 = _alpha_bbox(alpha)
+    yy = np.indices(alpha.shape)[0]
+    top = (alpha > 32) & (yy >= y0) & (yy <= y0 + max(4, int((y1 - y0) * 0.26)))
+    pix = arr[:, :, :3][top]
+    if pix.size == 0:
+        pix = arr[:, :, :3][alpha > 32]
+    if pix.size == 0:
+        return np.array(fallback, dtype=np.uint8)
+    rgb = np.median(pix.astype(np.float32), axis=0)
+    return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
+def _head_mask_from_filter(filter_arr):
+    return _head_region_mask(filter_arr[:, :, 3])
+
+
+def _head_region_mask(alpha, body_fraction=0.24):
+    import numpy as np
+
+    x0, y0, x1, y1 = _alpha_bbox(alpha)
+    body_h = max(1, y1 - y0)
+    top_y1 = min(alpha.shape[0], y0 + max(16, int(round(body_h * body_fraction))))
+    band = alpha[y0:top_y1, :] > 10
+    rows = np.where(band.any(axis=1))[0]
+    if rows.size == 0:
+        return np.zeros_like(alpha, dtype=bool)
+
+    first_rows = []
+    for row in rows[: max(4, min(24, rows.size))]:
+        xs = np.where(band[row])[0]
+        if xs.size > 1:
+            first_rows.append(float(xs.max() - xs.min() + 1))
+    if not first_rows:
+        return np.zeros_like(alpha, dtype=bool)
+
+    initial_width = float(np.median(first_rows))
+    # Stop before the shoulder row.  In the bald conditioning image and PSHuman
+    # side/back views, shoulder/body rows are an abrupt width jump versus skull
+    # rows.  Keeping the mask row-bounded avoids rectangular torso patches.
+    max_head_width = max(initial_width * 2.4, body_h * 0.11)
+    accepted_rows = []
+    for row in rows:
+        xs = np.where(band[row])[0]
+        if xs.size < 2:
+            continue
+        width = float(xs.max() - xs.min() + 1)
+        if accepted_rows and width > max_head_width:
+            break
+        accepted_rows.append(int(row))
+    if not accepted_rows:
+        return np.zeros_like(alpha, dtype=bool)
+
+    y_start = y0 + min(accepted_rows)
+    y_stop = y0 + max(accepted_rows) + 1
+    mask = np.zeros_like(alpha, dtype=bool)
+    mask[y_start:y_stop, :] = alpha[y_start:y_stop, :] > 10
+    return mask
+
+
+def _generated_head_geometry(alpha):
+    import numpy as np
+
+    band = _head_region_mask(alpha)
+    ys, xs = np.where(band)
+    if xs.size < 100:
+        x0, y0, x1, y1 = _alpha_bbox(alpha)
+        body_h = max(1, y1 - y0)
+        head_y1 = min(alpha.shape[0], y0 + max(12, int(round(body_h * 0.16))))
+        return band, (x0 + x1) * 0.5, y0, head_y1, max(1, x1 - x0)
+    return band, float(np.median(xs)), int(ys.min()), int(ys.max()) + 1, max(1, int(xs.max() - xs.min() + 1))
+
+
+def _normal_fill_rgb(normal_arr, mask):
+    import numpy as np
+
+    sample = normal_arr[:, :, :3][mask & (normal_arr[:, :, 3] > 10)]
+    if sample.size == 0:
+        return np.array([128, 128, 255], dtype=np.uint8)
+    return np.clip(np.median(sample.astype(np.float32), axis=0), 0, 255).astype(np.uint8)
+
+
+def _apply_bald_head_filter(colors: List, normals: List, mv_views: List[str], cfg) -> None:
+    """Remove hair/bun evidence from PSHuman carving inputs.
+
+    The single Seed `bald` flag passes a skull-shaped RGBA filter image here.
+    This runs after diffusion and before ReMesh so rejected hair evidence is not
+    allowed into either the dumped diagnostics or the mesh-carving inputs.
+    """
+    import numpy as np
+
+    filter_path = getattr(cfg, 'bald_head_filter_image', None)
+    if not filter_path:
+        return
+    if not os.path.exists(filter_path):
+        print(f'[bald-head-filter] skipped: missing {filter_path}', flush=True)
+        return
+
+    enabled_views = {
+        item.strip() for item in str(getattr(cfg, 'bald_head_filter_views', 'back')).split(',')
+        if item.strip()
+    }
+    image_size = colors[0].size[0]
+    crop_size = int(getattr(cfg.validation_dataset, 'crop_size', image_size))
+    filter_canvas = _preprocess_rgba_to_pshuman_canvas(filter_path, image_size, crop_size)
+    filter_arr = np.array(filter_canvas.convert('RGBA'), dtype=np.uint8)
+    filter_alpha = filter_arr[:, :, 3]
+    filter_head = _head_mask_from_filter(filter_arr)
+    skin_rgb = _skin_rgb_from_rgba(filter_arr, filter_alpha)
+
+    patched = []
+    for view in enabled_views:
+        if view not in mv_views:
+            continue
+        vi = mv_views.index(view)
+        c_arr = np.array(colors[vi].convert('RGBA'), dtype=np.uint8)
+        n_arr = np.array(normals[vi].convert('RGBA'), dtype=np.uint8)
+        alpha = c_arr[:, :, 3]
+        normal_rgb = _normal_fill_rgb(n_arr, filter_head)
+
+        if view == 'back':
+            mask = filter_head
+            c_arr[mask, :4] = filter_arr[mask, :4]
+            n_arr[mask, :3] = normal_rgb
+            n_arr[mask, 3] = np.maximum(n_arr[mask, 3], filter_alpha[mask])
+        else:
+            head_mask, cx, hy0, hy1, head_w = _generated_head_geometry(alpha)
+            if not np.any(head_mask):
+                continue
+            yy, xx = np.indices(alpha.shape)
+            head_h = max(1, hy1 - hy0)
+            if view == 'left':
+                posterior = xx < cx
+            else:
+                posterior = xx > cx
+            _bx0, by0, _bx1, by1 = _alpha_bbox(alpha)
+            body_h = max(1, by1 - by0)
+            bun_y0 = by0 + int(round(body_h * 0.04))
+            bun_y1 = by0 + int(round(body_h * 0.22))
+            bun_mask = (alpha > 10) & (yy >= bun_y0) & (yy <= bun_y1) & posterior
+            c_arr[bun_mask, 3] = 0
+            n_arr[bun_mask, 3] = 0
+
+        colors[vi] = Image.fromarray(c_arr, 'RGBA')
+        normals[vi] = Image.fromarray(n_arr, 'RGBA')
+        patched.append(view)
+
+    print(f'[bald-head-filter] patched views={patched} using {filter_path}', flush=True)
 
 
 def _upscale_mv_views(
@@ -623,6 +805,8 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                                         print(f"[mv-force-back] depthpro normals failed: {e}")
                         except Exception as e:
                             print(f"[mv-force-back] failed to replace back view: {e}")
+
+                    _apply_bald_head_filter(colors, normals, MV_VIEWS, cfg)
 
                     # ── DepthPro confidence-blend on diffusion normals ────────
                     if cfg.depthpro_normals_blend:
