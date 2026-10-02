@@ -1630,6 +1630,11 @@ ARM_DEPTH_JUMP_FRACTION = 0.6
 ARM_NECK_FRACTION = 0.35
 #: Healthy stations the rebuilt tube overlaps before the first defect, so the two blend in Poisson.
 ARM_RING_OVERLAP_STATIONS = 6
+#: Defects are searched for on the ARM only: the first this fraction of the stations from the
+#: armpit. The hand is the distal ~25% and naturally shows several surfaces (fingers, thumb);
+#: on flighter that read as "2 surfaces" at station 98/115 and "depth jump" at 114/115, healthy
+#: hands were flagged and 425 hand vertices moved. alena-bikini's real breaks were at 46-54%.
+ARM_DEFECT_SEARCH_FRACTION = 0.75
 #: Healthy stations the depth line is fitted over, to extrapolate across the defect.
 ARM_DEPTH_FIT_STATIONS = 30
 #: Rings per station. Kept at ONE: interpolating three per station with a half-point stagger
@@ -1810,7 +1815,10 @@ def rebuild_arms_from_front_mask(mesh, front_mask, ortho_scale):
         h = np.full(S, np.nan)
         defect, reason = None, None
         k_ref = None
+        search_end = int(ARM_DEFECT_SEARCH_FRACTION * S)
         for s in range(S):
+            if s >= search_end:
+                break
             g = groups_at(s)
             if not g:
                 defect, reason = s, "empty"
