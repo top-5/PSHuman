@@ -1229,13 +1229,102 @@ def part_removal(full_mesh, part_mesh, thres, device, smpl_obj, region, clean=Tr
 
     return full_mesh
 
-def keep_largest(mesh):
+#: A Poisson component this large relative to the body is anatomy, not noise. Measured on
+#: alena-bikini, whose two hands come back as separate components after Poisson pinches the
+#: wrists: body 143,504 verts, hands 2,596 (1.81%) and 2,512 (1.75%), and the only other
+#: components are hair specks at 132, 90 and 47 verts (0.09%, 0.06%, 0.03%). A 1% threshold
+#: separates those two populations by a factor of twenty.
+POISSON_KEEP_COMPONENT_MIN_FRACTION = 0.01
+
+#: ...AND it must be ADJACENT to the body, as a fraction of the body's longest axis. A hand
+#: that Poisson pinched off at the wrist is still touching: measured 0.0103 and 0.0460 on
+#: alena-bikini's two hands. Genuinely detached debris is nowhere near: on a badly fragmented
+#: reconstruction the eight largest stray components sit at 0.138 to 0.706. Size alone is NOT
+#: sufficient -- those strays are 11% to 98% of the body by vertex count, so a size-only rule
+#: readmits exactly the bridge artifacts that got PSHUMAN_POISSON_MERGE_COMPONENTS disabled.
+POISSON_KEEP_COMPONENT_MAX_GAP_FRACTION = 0.05
+
+
+def keep_largest(
+    mesh,
+    min_fraction: float = 0.0,
+    max_gap_fraction: float = POISSON_KEEP_COMPONENT_MAX_GAP_FRACTION,
+):
+    """Keep the body component; optionally also keep adjacent body-part-sized components.
+
+    DEFAULT IS LARGEST-ONLY, AGAIN. Keeping the pinched-off hands (pass
+    `min_fraction=POISSON_KEEP_COMPONENT_MIN_FRACTION`) restores arm SPAN, but what it keeps
+    is a pancake at the wrong depth: on alena-bikini the kept hand sat 0.052 deeper than its
+    arm stump, 0.023 thick by 0.123 wide, floating 0.045 from the body. Concatenating it is
+    not fusing it. The arm is now re-attached BEFORE Poisson by `rebuild_arms_from_front_mask`
+    (called from `poisson()` when reconstruct.py passes the front mask), so it comes out as one
+    connected component and there is nothing to keep. The option remains for diagnostics.
+
+    WHY THIS IS NO LONGER LARGEST-ONLY. Poisson reconstructs from a POINT CLOUD -- `poisson()`
+    exports the mesh and reads it back with `o3d.io.read_point_cloud`, discarding connectivity
+    -- and it pinches thin structures. On a subject with arms held out, it pinches both wrists,
+    so each hand comes back as its own connected component. Taking only the largest then
+    DELETES BOTH HANDS.
+
+    Measured on alena-bikini, arm span as width/height and hand depth/width, against a Meshy
+    ground truth of 0.725 / 0.986:
+
+        SMPL-X init                 0.745 / 0.927
+        after MeshOptimizer loop    0.692 / 0.716
+        Poisson raw output          0.690 / 0.751     <- arms still here
+        after largest-only          0.515 / 0.482     <- hands deleted
+
+    Poisson is not the problem and the depth is not the problem: 10, 11 and 12 give identical
+    results. One line was removing 26% of the arm span.
+
+    The discarded components are unmistakably hands -- 2,596 and 2,512 verts at lateral offset
+    +0.301 and -0.294, both at 0.59-0.60 of body height, which is where an A-pose hand is.
+
+    THIS IS NOT `PSHUMAN_POISSON_MERGE_COMPONENTS`, which is permanently disabled in this fork
+    because merging EVERY component stitches hair specks, foreground scratches and clothing
+    fragments into the body. The distinction is size: hands are 1.8% of the body, the specks
+    are 0.09% and below. This keeps the first population and still rejects the second, and it
+    welds nothing -- components are concatenated, not bridged.
+    """
     mesh_lst = mesh.split(only_watertight=False)
+    if not len(mesh_lst):
+        return mesh
     keep_mesh = mesh_lst[0]
-    for mesh in mesh_lst:
-        if mesh.vertices.shape[0] > keep_mesh.vertices.shape[0]:
-            keep_mesh = mesh
-    return keep_mesh
+    for candidate in mesh_lst:
+        if candidate.vertices.shape[0] > keep_mesh.vertices.shape[0]:
+            keep_mesh = candidate
+    if min_fraction <= 0.0:
+        return keep_mesh
+
+    import numpy as _np
+    import trimesh as _trimesh
+
+    body = _np.asarray(keep_mesh.vertices)
+    scale = float((body.max(axis=0) - body.min(axis=0)).max())
+    if scale <= 0.0:
+        return keep_mesh
+    threshold = keep_mesh.vertices.shape[0] * float(min_fraction)
+    max_gap = scale * float(max_gap_fraction)
+    try:
+        from scipy.spatial import cKDTree as _KDTree
+
+        tree = _KDTree(body)
+    except Exception:
+        tree = None
+
+    parts = [keep_mesh]
+    for part in mesh_lst:
+        if part is keep_mesh or part.vertices.shape[0] < threshold:
+            continue
+        if tree is not None:
+            gap = float(tree.query(_np.asarray(part.vertices))[0].min())
+            if gap > max_gap:
+                # Big, but detached: debris, not a pinched-off body part.
+                continue
+        parts.append(part)
+    if len(parts) <= 1:
+        return keep_mesh
+    return _trimesh.util.concatenate(parts)
 
 
 def _orthonormal_basis(axis):
@@ -1376,18 +1465,492 @@ def merge_close_components(mesh, max_gap=0.28, min_faces=1200, ring_vertices=48)
     return trimesh.util.concatenate([main] + passthrough)
 
 
-def poisson(mesh, obj_path, depth=10, decimation=True):
+def _poisson_raw(mesh, depth):
+    """Open3D Poisson on a mesh's oriented vertices, without any component filtering."""
+    import tempfile
 
-    pcd_path = obj_path[:-4] + "_soups.ply"
-    assert (mesh.vertex_normals.shape[1] == 3)
-    mesh.export(pcd_path)
-    pcl = o3d.io.read_point_cloud(pcd_path)
-    with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error) as cm:
-        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-            pcl, depth=depth, n_threads=6
+    mesh = mesh.copy()
+    _ = mesh.vertex_normals
+    with tempfile.TemporaryDirectory() as tmp:
+        ply = os.path.join(tmp, "soups.ply")
+        mesh.export(ply)
+        pcl = o3d.io.read_point_cloud(ply)
+        with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
+            out, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcl, depth=depth, n_threads=6)
+    return trimesh.Trimesh(np.array(out.vertices), np.array(out.triangles), process=False)
+
+
+#: Below this fraction of the body a component is a speck (hair strands measured at 0.03-0.09%)
+#: and is left to be dropped.
+ATTRACT_MIN_PART_FRACTION = 0.002
+#: Body vertices consulted, nearest in the frontal (X,Y) plane, to find the depth a part belongs at.
+ATTRACT_NEIGHBOURS = 64
+#: A part whose closest points are within this fraction of body extent already touches.
+ATTRACT_TOUCH_FRACTION = 0.004
+
+
+#: Radius of the healed band around each join, as a fraction of the body's longest extent.
+HEAL_JOIN_RADIUS_FRACTION = 0.03
+#: Taubin smoothing: shrink-free (lambda > 0, mu < -lambda), so a heal cannot thin the limb.
+HEAL_TAUBIN_LAMBDA = 0.5
+HEAL_TAUBIN_MU = -0.53
+HEAL_TAUBIN_ITERATIONS = 10
+
+
+def heal_joins(mesh, contact_points, radius_fraction=HEAL_JOIN_RADIUS_FRACTION):
+    """Restore a natural surface across the welds where displaced parts were re-fused.
+
+    Poisson welds a moved part to its stump at a narrow contact, which can leave a pinch or a
+    crease. This smooths ONLY a band of `radius_fraction` around those contacts, with Taubin
+    (alternating lambda/mu) rather than plain Laplacian so the band is not shrunk -- plain
+    Laplacian thins exactly the limbs this is meant to restore. Vertices outside the band are
+    held fixed by construction: their rows of the operator are the identity.
+    """
+    import scipy.sparse as sp
+    from scipy.spatial import cKDTree
+
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    scale = float((verts.max(axis=0) - verts.min(axis=0)).max())
+    if scale <= 0 or len(contact_points) == 0:
+        return mesh
+    dist, _ = cKDTree(np.asarray(contact_points)).query(verts)
+    band = dist <= radius_fraction * scale
+    if not band.any():
+        return mesh
+
+    lap = trimesh.smoothing.laplacian_calculation(mesh)          # row-normalised neighbour mean
+    n = len(verts)
+    keep = sp.diags((~band).astype(np.float64))
+    move = sp.diags(band.astype(np.float64))
+    eye = sp.identity(n, format="csr")
+    v = verts.copy()
+    for _ in range(int(HEAL_TAUBIN_ITERATIONS)):
+        for weight in (HEAL_TAUBIN_LAMBDA, HEAL_TAUBIN_MU):
+            delta = (lap @ v) - v
+            v = v + move @ (weight * delta)                       # only band vertices move
+            v = keep @ verts + move @ v                           # and the rest stay exactly put
+    healed = mesh.copy()
+    healed.vertices = v
+    return healed
+
+
+def attract_parts_to_body_plane(raw_mesh, depth=10, passes=2):
+    """Move displaced body parts back onto the body's depth plane, then re-fuse. Do not drop them.
+
+    A HUMAN IS ONE CONNECTED SURFACE. When Poisson returns a hand or forearm as its own
+    component, that piece is not noise -- it is the subject's arm, reconstructed at the wrong
+    DEPTH, so it no longer touches the stump. Measured on alena-bikini the detached arm chunks
+    sat at dz -0.131, -0.195, -0.249 (mesh units, body ~2 tall) from where the body is behind
+    them, and the hand that was kept separately sat 0.052 off its own stump.
+
+    For an A-pose subject the body is close to planar in depth, so each chunk is translated
+    along Z only -- its X,Y are what the views agree on -- to the median depth of the body
+    surface it projects onto, then the whole set is re-run through Poisson so the contacts fuse.
+    Specks below `ATTRACT_MIN_PART_FRACTION` are left for `keep_largest` to drop.
+
+    On alena-bikini: Poisson alone gave 30 components and an arm span of 0.488 (width/height);
+    after attraction and re-fusion it is one body with span 0.692, against the reconstruction's
+    own 0.694 before Poisson and a Meshy ground truth of 0.725.
+
+    SUPERSEDED as the primary fix by `rebuild_arms_from_front_mask`, which runs before Poisson.
+    This pass is the fallback for callers without a front mask. It is not sufficient on its own:
+    on alena-bikini the moved right forearm re-separated after the second Poisson (gap 0.011) and
+    `keep_largest` dropped it.
+
+    PSHUMAN_POISSON_ATTRACT_PARTS=0 disables it.
+    """
+    from scipy.spatial import cKDTree
+
+    mesh = raw_mesh
+    contacts = []
+    for _ in range(int(passes)):
+        parts = sorted(mesh.split(only_watertight=False), key=lambda m: -len(m.vertices))
+        if len(parts) <= 1:
+            break
+        body = parts[0]
+        body_v = np.asarray(body.vertices)
+        tree = cKDTree(body_v[:, :2])
+        moved = [body]
+        changed = False
+        for part in parts[1:]:
+            if len(part.vertices) < ATTRACT_MIN_PART_FRACTION * len(body_v):
+                continue
+            pv = np.asarray(part.vertices).copy()
+            k = min(ATTRACT_NEIGHBOURS, len(body_v))
+            _, idx = tree.query(pv[:, :2], k=k)
+            dz = float(np.median(body_v[np.asarray(idx).ravel(), 2]) - np.median(pv[:, 2]))
+            pv[:, 2] += dz
+            # ATTRACT TO CONTACT, not only to the plane. Depth alignment is enough when the
+            # break was a depth error, but where Poisson pinched a thin limb there is also a
+            # lateral gap, and a part moved only in Z still floats. Measured on alena-bikini:
+            # depth alignment re-fused the left forearm (reach 68% -> 91% of the SMPL-X arm) but
+            # left the right one detached (71%). So translate the part rigidly by the mean offset
+            # of its closest point pairs to the body, which closes the gap to contact while
+            # preserving the part's own shape.
+            body_tree = cKDTree(body_v)
+            gap, nearest = body_tree.query(pv)
+            near = np.argsort(gap)[: max(8, len(pv) // 50)]
+            touch = ATTRACT_TOUCH_FRACTION * float((body_v.max(axis=0) - body_v.min(axis=0)).max())
+            if float(gap[near].mean()) > touch:
+                pv += (body_v[nearest[near]] - pv[near]).mean(axis=0)
+                gap, _ = body_tree.query(pv)
+                near = np.argsort(gap)[: max(8, len(pv) // 20)]
+            # Where this part meets the body after moving: its points closest to the body,
+            # in 3-D. That is where the weld will form and where the heal is applied.
+            contacts.append(pv[near])
+            shifted = part.copy()
+            shifted.vertices = pv
+            moved.append(shifted)
+            changed = True
+        if not changed:
+            break
+        mesh = _poisson_raw(trimesh.util.concatenate(moved), depth)
+    if contacts and os.environ.get("PSHUMAN_POISSON_HEAL_JOINS", "1").strip().lower() not in {"0", "false", "no", "off"}:
+        mesh = heal_joins(mesh, np.concatenate(contacts))
+    return mesh
+
+
+#: Arm stations are this many front-mask pixels apart along the arm.
+ARM_STATION_STEP_PX = 2.0
+#: Mesh vertices within this many pixels outside the mask half-width still belong to a station.
+ARM_BAND_MARGIN_PX = 3.0
+#: Depth statistics at a station pool the vertices of this many neighbouring stations each side.
+ARM_WINDOW_STATIONS = 2
+#: Arm seed: front-mask pixels beyond this fraction of the side's lateral extent are arm, not torso.
+ARM_SEED_LATERAL_FRACTION = 0.6
+#: Walking inward, a cross-section this many times wider than the recent median has hit the torso.
+ARM_TORSO_MERGE_RATIO = 2.2
+#: Two depth groups at one station are separate surfaces when this far apart, as a fraction of the
+#: local half-width (floored at ARM_DEPTH_GAP_SCALE_FRACTION of the body extent).
+ARM_DEPTH_GAP_FRACTION = 0.3
+ARM_DEPTH_GAP_SCALE_FRACTION = 0.006
+#: A depth-centre jump between neighbouring stations above this fraction of the half-width is a step.
+ARM_DEPTH_JUMP_FRACTION = 0.6
+#: Thinner than this fraction of the arm's own healthy depth/width ratio is a strangled neck.
+ARM_NECK_FRACTION = 0.35
+#: Healthy stations the rebuilt tube overlaps before the first defect, so the two blend in Poisson.
+ARM_RING_OVERLAP_STATIONS = 6
+#: Healthy stations the depth line is fitted over, to extrapolate across the defect.
+ARM_DEPTH_FIT_STATIONS = 30
+#: Rings per station. Kept at ONE: interpolating three per station with a half-point stagger
+#: between successive rings turned the arm into a twisted spiral in Poisson (alena-bikini,
+#: 2026-10-02 02:41), visibly worse than the faint banding of one ring per station.
+ARM_RING_SUBSTEPS = 1
+
+
+def _front_mask_bool(front_mask):
+    m = front_mask
+    if hasattr(m, "detach"):
+        m = m.detach().cpu().numpy()
+    m = np.asarray(m)
+    if m.ndim == 3:
+        m = m[..., 0]
+    return m > (127 if m.dtype == np.uint8 else 0.5)
+
+
+def _arm_stations(mask, ortho_scale, side, cx):
+    """Walk one arm of the FRONT silhouette from fingertip to armpit.
+
+    Returns origin, direction, normal (2-D, mesh units) and a (S, 3) array of stations
+    (t along the arm, w centre across it, r half-width), ordered proximal -> distal. Every
+    quantity here is read off the front mask, which is the ground truth for where the arm is.
+    """
+    H, W = mask.shape
+    px = 2.0 * ortho_scale / W
+    ys, xs = np.nonzero(mask)
+    X = (xs + 0.5) * px - ortho_scale
+    Y = ortho_scale - (ys + 0.5) * px
+    lat = side * (X - cx)
+    if lat.size == 0 or lat.max() <= 0:
+        return None
+    seed = lat > ARM_SEED_LATERAL_FRACTION * lat.max()
+    if seed.sum() < 50:
+        return None
+    pts = np.c_[X[seed], Y[seed]]
+    origin = pts.mean(axis=0)
+    _, _, vt = np.linalg.svd(pts - origin, full_matrices=False)
+    d = vt[0]
+    if side * d[0] < 0:
+        d = -d
+    n = np.array([-d[1], d[0]])
+    step = ARM_STATION_STEP_PX * px
+    wgrid = np.arange(-0.6, 0.6, px)
+    t = float(((pts - origin) @ d).max())
+    t_min = float(((np.c_[X, Y] - origin) @ d).min())
+    stations, w_prev = [], None
+    while t > t_min:
+        q = origin[None, :] + t * d[None, :] + wgrid[:, None] * n[None, :]
+        cols = ((q[:, 0] + ortho_scale) / px).astype(int)
+        rows = ((ortho_scale - q[:, 1]) / px).astype(int)
+        inside = (rows >= 0) & (rows < H) & (cols >= 0) & (cols < W)
+        on = np.zeros(len(wgrid), dtype=bool)
+        on[inside] = mask[rows[inside], cols[inside]]
+        edges = np.flatnonzero(np.diff(np.r_[0, on.astype(np.int8), 0]))
+        runs = list(zip(edges[0::2], edges[1::2] - 1))
+        if not runs:
+            if stations:
+                break
+            t -= step
+            continue
+        ref = 0.0 if w_prev is None else w_prev
+        a, b = min(runs, key=lambda r: abs(0.5 * (wgrid[r[0]] + wgrid[r[1]]) - ref))
+        half = 0.5 * (wgrid[b] - wgrid[a] + px)
+        if len(stations) > 15:
+            recent = np.median([s[2] for s in stations[-15:]])
+            if half > ARM_TORSO_MERGE_RATIO * recent or a == 0 or b == len(wgrid) - 1:
+                break
+        w_prev = 0.5 * (wgrid[a] + wgrid[b])
+        stations.append((t, w_prev, half))
+        t -= step
+    if len(stations) < 20:
+        return None
+    return origin, d, n, np.asarray(stations[::-1]), step
+
+
+#: Normal z-component that counts as facing the front (or, negated, the back) when deciding
+#: whether a depth gap is empty space between two surfaces or just the sides of one tube.
+ARM_FACING_NZ = 0.2
+
+
+def _depth_groups(z, labels, gap, nz):
+    """Split one station's vertex depths into separate surfaces: by component, then by depth gaps.
+
+    A gap only separates two surfaces when it is OUTSIDE the body: the vertices just below it face
+    the front (+z) and those just above face the back (-z). Inside one tube it is the other way
+    round, and a sparse tube has gaps at its sides that are not a second surface.
+    """
+    groups = []
+    for lab in np.unique(labels):
+        sel = labels == lab
+        order = np.argsort(z[sel])
+        zl, nl = z[sel][order], nz[sel][order]
+        cuts = []
+        for i in np.flatnonzero(np.diff(zl) > gap):
+            below, above = nl[max(0, i - 4): i + 1], nl[i + 1: i + 6]
+            if below.mean() > ARM_FACING_NZ and above.mean() < -ARM_FACING_NZ:
+                cuts.append(i + 1)
+        for part in np.split(zl, cuts):
+            lo, hi = np.percentile(part, 5), np.percentile(part, 95)
+            groups.append({"label": int(lab), "n": len(part), "c": 0.5 * (lo + hi), "h": 0.5 * (hi - lo)})
+    return groups
+
+
+def rebuild_arms_from_front_mask(mesh, front_mask, ortho_scale):
+    """Re-attach every arm piece at the depth the FRONT VIEW implies, and rebuild the tissue between.
+
+    THE DEFECT. The MeshOptimizer returns arms whose distal part sits at a different depth from the
+    upper arm. On alena-bikini the left forearm is its own component 0.15 in front of its stump,
+    and the right forearm is 0.18 in front, joined to the upper arm only by a 0.019-wide sliver.
+    Poisson cuts the sliver, and `keep_largest` then deleted the whole right forearm: the remeshed
+    mesh had both arms, coarse.glb had one. Moving the piece afterwards and re-running Poisson did
+    not hold either -- it re-separated at 0.011 and was dropped again.
+
+    THE GROUND TRUTH. The front view is the one view every pipeline stage agrees on: rasterised
+    from the front, this mesh matches the front mask at IoU 0.967, including both arms. So the arm
+    is walked ALONG THE FRONT SILHOUETTE from the fingertip to the armpit, and every station's
+    position and width come from the mask. Depth is the only thing taken from the mesh, and it is
+    made continuous:
+
+      1. Proximal to distal, the first station where the arm stops being one surface (a second
+         component, a second depth layer, a depth jump, or a strangled neck) is the defect.
+      2. Distal of it, the piece is tracked inward from the fingertip and SHIFTED IN DEPTH so its
+         centre continues the upper arm's depth line -- a human is one connected surface, and an
+         A-pose arm continues from its shoulder. The piece's own depth slope is kept.
+      3. The tissue from the defect to the fingertip is rebuilt as elliptical rings: half-width
+         from the front mask, half-depth from the moved piece, never thinner than the subject's
+         own upper-arm depth/width ratio. Mesh vertices in that span are replaced, not kept beside
+         the rings, so no pancake survives inside the tube.
+
+    Nothing is dropped. A healthy arm has no defect and is returned untouched. The join where the
+    rebuilt tube meets the upper arm is returned as `report["_join_points"]` for `heal_joins`.
+
+    Returns (points, normals, report): the Poisson input.
+    """
+    import trimesh as _trimesh
+
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    vnormals = np.asarray(mesh.vertex_normals, dtype=np.float64)
+    labels = _trimesh.graph.connected_component_labels(mesh.edges_unique, node_count=len(verts))
+    body_label = int(np.bincount(labels).argmax())
+    scale = float((verts.max(axis=0) - verts.min(axis=0)).max())
+    mask = _front_mask_bool(front_mask)
+    px = 2.0 * float(ortho_scale) / mask.shape[1]
+    cx = float(np.median(verts[:, 0]))
+
+    keep = np.ones(len(verts), dtype=bool)
+    verts_out = verts.copy()
+    ring_pts, ring_nrm, joins = [], [], []
+    report = {"contract": "pshuman.arm_frontal_rebuild.v1", "sides": {}}
+
+    for side, name in ((1, "left"), (-1, "right")):
+        walk = _arm_stations(mask, float(ortho_scale), side, cx)
+        if walk is None:
+            report["sides"][name] = {"status": "no_arm_in_front_mask"}
+            continue
+        origin, d, n, st, step = walk
+        S = len(st)
+        tv = (verts[:, :2] - origin) @ d
+        wv = (verts[:, :2] - origin) @ n
+        idx = np.rint((tv - st[0, 0]) / step).astype(np.int64)
+        valid = (idx >= 0) & (idx < S)
+        ci = np.clip(idx, 0, S - 1)
+        band = valid & (np.abs(wv - st[ci, 1]) <= st[ci, 2] + ARM_BAND_MARGIN_PX * px)
+        bi = np.flatnonzero(band)
+        b_idx, b_z, b_lab, b_nz = idx[bi], verts[bi, 2], labels[bi], vnormals[bi, 2]
+
+        def groups_at(s):
+            m = np.abs(b_idx - s) <= ARM_WINDOW_STATIONS
+            if not m.any():
+                return []
+            gap = max(ARM_DEPTH_GAP_FRACTION * st[s, 2], ARM_DEPTH_GAP_SCALE_FRACTION * scale)
+            return _depth_groups(b_z[m], b_lab[m], gap, b_nz[m])
+
+        # 1. proximal -> distal: healthy while one body surface, continuous, not strangled
+        c = np.full(S, np.nan)
+        h = np.full(S, np.nan)
+        defect, reason = None, None
+        k_ref = None
+        for s in range(S):
+            g = groups_at(s)
+            if not g:
+                defect, reason = s, "empty"
+                break
+            if len(g) > 1 or g[0]["label"] != body_label:
+                defect, reason = s, f"{len(g)} surfaces" if len(g) > 1 else "detached component"
+                break
+            if s > 0 and abs(g[0]["c"] - c[s - 1]) > ARM_DEPTH_JUMP_FRACTION * st[s, 2]:
+                defect, reason = s, "depth jump"
+                break
+            if k_ref is None and s >= 20:
+                k_ref = float(np.median(h[:s] / st[:s, 2]))
+            if k_ref is not None and g[0]["h"] < ARM_NECK_FRACTION * k_ref * st[s, 2]:
+                defect, reason = s, "strangled neck"
+                break
+            c[s], h[s] = g[0]["c"], g[0]["h"]
+        if k_ref is None:
+            healthy = np.isfinite(h[: max(defect or 0, 1)])
+            k_ref = float(np.median(h[: max(defect or 0, 1)][healthy] / st[: max(defect or 0, 1), 2][healthy])) if healthy.any() else 0.8
+        if defect is None:
+            report["sides"][name] = {"status": "healthy", "stations": S, "depth_over_width": k_ref}
+            continue
+        if defect < 5:
+            report["sides"][name] = {"status": "defect_at_armpit_not_rebuilt", "stations": S, "reason": reason}
+            continue
+
+        # 2. fingertip -> defect: track the distal piece, then shift it onto the upper arm's depth line
+        cd = np.full(S, np.nan)
+        hd = np.full(S, np.nan)
+        prev = None
+        for s in range(S - 1, defect - 1, -1):
+            g = groups_at(s)
+            if not g:
+                continue
+            pick = max(g, key=lambda q: q["n"]) if prev is None else min(g, key=lambda q: abs(q["c"] - prev))
+            cd[s], hd[s], prev = pick["c"], pick["h"], pick["c"]
+        dist = np.flatnonzero(np.isfinite(cd))
+        if dist.size == 0:
+            report["sides"][name] = {"status": "no_distal_surface", "stations": S, "defect_station": defect}
+            continue
+        fit = np.arange(max(0, defect - ARM_DEPTH_FIT_STATIONS), defect)
+        fit = fit[np.isfinite(c[fit])]
+        slope, icpt = np.polyfit(fit, c[fit], 1) if fit.size >= 3 else (0.0, float(np.nanmean(c[:defect])))
+        first = dist[:10]
+        offset = float(np.median(slope * first + icpt - cd[first]))
+        all_s = np.arange(S)
+        cd = np.interp(all_s, dist, cd[dist]) + offset
+        hd = np.interp(all_s, dist, hd[dist])
+
+        start = max(0, defect - ARM_RING_OVERLAP_STATIONS)
+        cc = np.where(all_s < defect, c, cd)
+        hh = np.where(all_s < defect, h, np.maximum(hd, k_ref * st[:, 2]))
+        span = all_s >= start
+        kern = np.ones(5) / 5.0
+        for arr in (cc, hh):
+            seg = np.pad(arr[span], 2, mode="edge")
+            arr[span] = np.convolve(seg, kern, mode="valid")
+
+        # 3. MOVE THE DISTAL PIECE, KEEP ITS OWN SURFACE. No tube is generated: an elliptical
+        # ring rebuild here read as "circles" / a mummy wrap, and the arm's anatomical shape is
+        # supplied later by the SMPL-X donor graft (`seed.graft.arm_graft`). PSHuman's job is only
+        # to not lose the piece: each vertex past the defect that belongs to the distal surface
+        # (nearer its depth track than the upper arm's line) is shifted by the offset.
+        sel = bi[b_idx >= defect]
+        si = np.clip(idx[sel], 0, S - 1)
+        distal_track = cd[si] - offset
+        upper_line = slope * si + icpt
+        is_distal = np.abs(verts[sel, 2] - distal_track) < np.abs(verts[sel, 2] - upper_line)
+        moved_ids = sel[is_distal]
+        verts_out[moved_ids, 2] += offset
+        removed = np.zeros(0, dtype=np.int64)
+        n_ring = 0
+        for s in range(max(0, defect - 4), min(S, defect + 5)):
+            joins.append(np.r_[origin + st[s, 0] * d + st[s, 1] * n, cc[s]])
+
+        moved_before = slope * defect + icpt - (cd[defect] - offset)
+        report["sides"][name] = {
+            "status": "rebuilt",
+            "rebuilt_from_station": int(start),
+            "reason": reason,
+            "stations": S,
+            "defect_station": int(defect),
+            "defect_fraction_of_arm": round(defect / S, 3),
+            "depth_offset_applied": round(offset, 4),
+            "depth_step_closed": round(float(moved_before), 4),
+            "depth_over_width_floor": round(k_ref, 3),
+            "distal_depth_over_width_before": round(float(np.nanmedian(hd[defect:] / st[defect:, 2])), 3),
+            "mesh_vertices_moved": int(moved_ids.size),
+        }
+        print(
+            f"[arm-rebuild] {name}: {reason} at {defect}/{S} ({defect / S:.0%} of arm); distal piece moved "
+            f"{offset:+.4f} in depth onto the upper arm ({moved_ids.size} verts, own surface kept, no tube)",
+            flush=True,
         )
-    os.remove(pcd_path)
-    raw_mesh = trimesh.Trimesh(np.array(mesh.vertices), np.array(mesh.triangles), process=False)
+
+    report["_join_points"] = np.asarray(joins).reshape(-1, 3)
+    points = verts_out[keep]
+    normals = vnormals[keep]
+    if ring_pts:
+        points = np.vstack([points] + ring_pts)
+        normals = np.vstack([normals] + ring_nrm)
+    return points, normals, report
+
+
+def _poisson_points(points, normals, depth):
+    pcl = o3d.geometry.PointCloud()
+    pcl.points = o3d.utility.Vector3dVector(np.ascontiguousarray(points, dtype=np.float64))
+    pcl.normals = o3d.utility.Vector3dVector(np.ascontiguousarray(normals, dtype=np.float64))
+    with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
+        out, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcl, depth=depth, n_threads=6)
+    return trimesh.Trimesh(np.array(out.vertices), np.array(out.triangles), process=False)
+
+
+def poisson(mesh, obj_path, depth=10, decimation=True, front_mask=None, ortho_scale=None, report_path=None):
+
+    assert (mesh.vertex_normals.shape[1] == 3)
+    arm_joins = None
+    if front_mask is not None and ortho_scale is not None and os.environ.get(
+        "PSHUMAN_ARM_FRONTAL_REBUILD", "1"
+    ).strip().lower() not in {"0", "false", "no", "off"}:
+        # Arms are re-attached and their tissue rebuilt from the FRONT silhouette before the
+        # single Poisson; see `rebuild_arms_from_front_mask`.
+        points, normals, report = rebuild_arms_from_front_mask(mesh, front_mask, ortho_scale)
+        arm_joins = report.pop("_join_points")
+        if report_path:
+            import json as _json
+
+            with open(report_path, "w") as fh:
+                _json.dump(report, fh, indent=2)
+        raw_mesh = _poisson_points(points, normals, depth)
+    else:
+        pcd_path = obj_path[:-4] + "_soups.ply"
+        mesh.export(pcd_path)
+        pcl = o3d.io.read_point_cloud(pcd_path)
+        with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error) as cm:
+            mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                pcl, depth=depth, n_threads=6
+            )
+        os.remove(pcd_path)
+        raw_mesh = trimesh.Trimesh(np.array(mesh.vertices), np.array(mesh.triangles), process=False)
     # Permanently disabled in this fork.
     #
     # The close-component bridge pass was a local experiment, not upstream
@@ -1396,7 +1959,17 @@ def poisson(mesh, obj_path, depth=10, decimation=True):
     # Preserve largest-component behavior for production output.
     if os.environ.get("PSHUMAN_POISSON_MERGE_COMPONENTS", "0").strip().lower() in {"1", "true", "yes", "on"}:
         print("[poisson-merge] requested but permanently disabled because it creates bridge artifacts")
-    largest_mesh = keep_largest(raw_mesh)
+    if os.environ.get("PSHUMAN_POISSON_ATTRACT_PARTS", "1").strip().lower() not in {"0", "false", "no", "off"}:
+        raw_mesh = attract_parts_to_body_plane(raw_mesh, depth=depth)
+    # After an arm re-attachment, an arm piece Poisson still left separate is KEPT (adjacent and
+    # body-part sized), never dropped; the donor graft replaces the arm anyway.
+    largest_mesh = keep_largest(
+        raw_mesh, min_fraction=POISSON_KEEP_COMPONENT_MIN_FRACTION if arm_joins is not None else 0.0
+    )
+    if arm_joins is not None and len(arm_joins) and os.environ.get(
+        "PSHUMAN_POISSON_HEAL_JOINS", "1"
+    ).strip().lower() not in {"0", "false", "no", "off"}:
+        largest_mesh = heal_joins(largest_mesh, arm_joins)
     
     if decimation:
         # mesh decimation for faster rendering

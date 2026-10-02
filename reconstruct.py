@@ -2189,9 +2189,54 @@ class ReMesh:
                 flush=True,
             )
 
-        #### replace hand
+        #### replace distal arms (forearm + hand) with the fitted SMPL-X, then fuse
+        #
+        # WHY. The MeshOptimizer's side-view alpha loss flattens extended forearms into a paper
+        # sheet, and Poisson then pinches the thin wrist so the hand comes back as a separate,
+        # mis-placed component. Measured on alena-bikini with rays cast along Z through the arm
+        # (thickness in body-normalised units; the fitted SMPL-X is the reference):
+        #
+        #                         70% along arm   82%       92% (hand)  97%
+        #     SMPL-X fit           0.029           0.057     0.018       0.025
+        #     reconstruction       0.006           0.011     missing     missing
+        #
+        # The hand that did survive sat 0.052 deeper than the arm stump it belonged to and was
+        # 0.023 thick by 0.123 wide -- a pancake at the wrong depth. Keeping it, welding it or
+        # smoothing it all leave a pancake. Upstream's `replace_hand` swaps in the SMPL-X hand
+        # but only the MANO vertices, which left a gap at the forearm.
+        #
+        # So the forearm AND hand are taken from the fitted SMPL-X -- vertices whose dominant
+        # skinning joint is an elbow (18, 19), a wrist (20, 21) or a finger (25-54); 2,016 ids,
+        # fixed by SMPL-X topology -- the reconstruction is cut back around them, and Poisson
+        # runs over the union so the join is one continuous surface. On alena-bikini that gives
+        # ONE component, arm span 0.734 against a Meshy ground truth of 0.725, and the hand
+        # matching the SMPL-X thickness at every probe. The upper arm and everything else is
+        # still the reconstruction.
+        #
+        # Downstream, the wrist graft cuts at the wrist and splices a donor hand again; this
+        # makes sure there is a real forearm at the right depth for it to attach to.
+        # OPT-IN (PSHUMAN_REPLACE_DISTAL_ARMS=1). On a first pass the SMPL-X arm can sit at a
+        # different depth from the reconstruction and come back detached; the default fix is
+        # now `attract_parts_to_body_plane` inside `poisson()`, which fuses whatever arm the
+        # reconstruction produced instead of swapping it.
         smpl_data = SMPLX()
-        if self.opt.replace_hand  and True in pose['hands_visibility'][0]:
+        distal_vids_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "dataset", "smplx_distal_arm_vids.npy")
+        if _env_bool("PSHUMAN_REPLACE_DISTAL_ARMS", False) and os.path.exists(distal_vids_path) \
+                and mesh_smpl.vertices.shape[0] == smpl_data.smplx_verts.shape[0]:
+            distal_mask = torch.zeros(smpl_data.smplx_verts.shape[0], )
+            distal_mask.index_fill_(0, torch.from_numpy(np.load(distal_vids_path)).long(), 1.0)
+            distal_mesh = apply_vertex_mask(mesh_smpl.copy(), distal_mask)
+            body_mesh = part_removal(
+                mesh_remeshed.copy(),
+                distal_mesh,
+                0.08,
+                self.device,
+                mesh_smpl.copy(),
+                region="hand"
+            )
+            print(f"[reconstruct] distal arms replaced from SMPL-X ({int(distal_mask.sum())} verts) and fused", flush=True)
+            final = poisson(sum([distal_mesh, body_mesh]), f'{case_path}/{case}_final.obj', 10, False)
+        elif self.opt.replace_hand  and True in pose['hands_visibility'][0]:
             hand_mask = torch.zeros(smpl_data.smplx_verts.shape[0], )
             if pose['hands_visibility'][0][0]:
                 hand_mask.index_fill_(
@@ -2213,7 +2258,19 @@ class ReMesh:
             )
             final = poisson(sum([hand_mesh, body_mesh]), f'{case_path}/{case}_final.obj', 10, False)
         else:
-            final = poisson(mesh_remeshed, f'{case_path}/{case}_final.obj', 10, False)
+            # The FRONT silhouette at native resolution (the `masks` tensor is eroded) is the ground
+            # truth the arms are re-attached against; see `rebuild_arms_from_front_mask`. View 0 of
+            # `nrm_img` is front_face, and its alpha is the front mask.
+            front_alpha = np.array(nrm_img[0].convert('RGBA'))[..., 3]
+            final = poisson(
+                mesh_remeshed,
+                f'{case_path}/{case}_final.obj',
+                10,
+                False,
+                front_mask=front_alpha,
+                ortho_scale=float(self.opt.scale) / 2.0,
+                report_path=f'{case_path}/{case}_arm_rebuild.json',
+            )
         vertices = torch.from_numpy(final.vertices).float().to(self.device)
         faces = torch.from_numpy(final.faces).long().to(self.device)
         # Differing from paper, we use the texturing method in Unique3D
