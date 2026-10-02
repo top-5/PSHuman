@@ -1634,7 +1634,26 @@ ARM_RING_OVERLAP_STATIONS = 6
 #: armpit. The hand is the distal ~25% and naturally shows several surfaces (fingers, thumb);
 #: on flighter that read as "2 surfaces" at station 98/115 and "depth jump" at 114/115, healthy
 #: hands were flagged and 425 hand vertices moved. alena-bikini's real breaks were at 46-54%.
-ARM_DEFECT_SEARCH_FRACTION = 0.75
+ARM_DEFECT_SEARCH_FRACTION = 0.70
+#: ...and only from this fraction outward. Near the armpit the torso falls inside the arm's
+#: window when the arm hangs close to the body: bald-european's left arm read "2 surfaces" at
+#: station 6/127 (5%) and was shifted 0.19 in depth, bald-african's at 23/127 (18%). Real breaks
+#: measured on alena-bikini sit at 38-54%; false ones at 5%, 18%, 72% (wrist) and 85-98% (hand).
+ARM_DEFECT_SEARCH_START = 0.25
+#: An arm whose forearm depth centreline drifts from its upper arm's line by more than this
+#: (fraction of body height; 4 cm on a 170 cm body) is FLATTENED back onto that line. The
+#: break checks above miss a SHEARED arm: one connected surface, forearm offset in depth,
+#: joined by a smeared ramp. Measured on the 2026-10-02 rerun (cm, left / right):
+#:     flighter (healthy)   +2.0 / +1.9
+#:     alena-nude           +6.0 / +1.3     alena-dress    +6.7 / +1.8
+#:     bald-african         -5.9 / -1.2     bald-european -11.1 / -3.2
+#: Healthy arms stay within 3.2 cm; every sheared one is >= 5.9 cm, almost always the left.
+ARM_DEPTH_DRIFT_MAX_FRACTION = 4.0 / 170.0
+#: Station ranges (fractions of the arm from the armpit) for the upper-arm line and the drift.
+ARM_DRIFT_FIT_RANGE = (0.10, 0.40)
+ARM_DRIFT_MEASURE_RANGE = (0.60, 0.75)
+#: The correction is smoothed over this many stations so the shear becomes a ramp, not a step.
+ARM_DRIFT_SMOOTH_STATIONS = 15
 #: Healthy stations the depth line is fitted over, to extrapolate across the defect.
 ARM_DEPTH_FIT_STATIONS = 30
 #: Rings per station. Kept at ONE: interpolating three per station with a half-point stagger
@@ -1740,6 +1759,45 @@ def _depth_groups(z, labels, gap, nz):
     return groups
 
 
+def _flatten_depth_drift(verts, verts_out, bi, b_idx, st, height):
+    """Flatten a sheared forearm onto its upper arm's depth line, in place in `verts_out`.
+
+    Returns None when the drift is within ARM_DEPTH_DRIFT_MAX_FRACTION of the body height,
+    else {"drift", "moved", "line"}. The correction at each station is the smoothed residual of
+    the depth centreline from the upper-arm line, applied from mid-arm outward and held constant
+    past the measure range so the hand moves with the wrist rather than being reshaped.
+    """
+    S = len(st)
+    c = np.full(S, np.nan)
+    for s in range(S):
+        z = verts[bi[np.abs(b_idx - s) <= ARM_WINDOW_STATIONS], 2]
+        if z.size >= 6:
+            c[s] = 0.5 * (np.percentile(z, 5) + np.percentile(z, 95))
+    good = np.flatnonzero(np.isfinite(c))
+    if good.size < 0.6 * S:
+        return None
+    c = np.interp(np.arange(S), good, c[good])
+    prox = np.arange(int(ARM_DRIFT_FIT_RANGE[0] * S), int(ARM_DRIFT_FIT_RANGE[1] * S))
+    dist = np.arange(int(ARM_DRIFT_MEASURE_RANGE[0] * S), int(ARM_DRIFT_MEASURE_RANGE[1] * S))
+    if prox.size < 3 or dist.size < 1:
+        return None
+    slope, icpt = np.polyfit(prox, c[prox], 1)
+    line = slope * np.arange(S) + icpt
+    drift = float(np.median(c[dist] - line[dist]))
+    if abs(drift) <= ARM_DEPTH_DRIFT_MAX_FRACTION * height:
+        return None
+    resid = c - line
+    hold = int(ARM_DRIFT_MEASURE_RANGE[1] * S)
+    resid[hold:] = resid[hold - 1]                  # the hand follows the wrist
+    resid[: int(ARM_DRIFT_FIT_RANGE[1] * S)] = 0.0   # the upper arm stays where it is
+    width = ARM_DRIFT_SMOOTH_STATIONS
+    corr = np.convolve(np.pad(resid, width // 2, mode="edge"), np.ones(width) / width, mode="valid")
+    station = np.clip(b_idx, 0, S - 1)
+    moved = corr[station] != 0.0
+    verts_out[bi[moved], 2] -= corr[station[moved]]
+    return {"drift": drift, "moved": int(moved.sum()), "line": line}
+
+
 def rebuild_arms_from_front_mask(mesh, front_mask, ortho_scale):
     """Re-attach every arm piece at the depth the FRONT VIEW implies, and rebuild the tissue between.
 
@@ -1784,6 +1842,7 @@ def rebuild_arms_from_front_mask(mesh, front_mask, ortho_scale):
 
     keep = np.ones(len(verts), dtype=bool)
     verts_out = verts.copy()
+    scale_h = float(np.ptp(verts[:, 1])) or 1.0
     ring_pts, ring_nrm, joins = [], [], []
     report = {"contract": "pshuman.arm_frontal_rebuild.v1", "sides": {}}
 
@@ -1816,9 +1875,17 @@ def rebuild_arms_from_front_mask(mesh, front_mask, ortho_scale):
         defect, reason = None, None
         k_ref = None
         search_end = int(ARM_DEFECT_SEARCH_FRACTION * S)
+        search_start = int(ARM_DEFECT_SEARCH_START * S)
         for s in range(S):
             if s >= search_end:
                 break
+            if s < search_start:
+                # Still record the healthy upper arm's depth: the depth line is fitted on it.
+                g = groups_at(s)
+                if g:
+                    best = max(g, key=lambda q: q["n"])
+                    c[s], h[s] = best["c"], best["h"]
+                continue
             g = groups_at(s)
             if not g:
                 defect, reason = s, "empty"
@@ -1839,7 +1906,26 @@ def rebuild_arms_from_front_mask(mesh, front_mask, ortho_scale):
             healthy = np.isfinite(h[: max(defect or 0, 1)])
             k_ref = float(np.median(h[: max(defect or 0, 1)][healthy] / st[: max(defect or 0, 1), 2][healthy])) if healthy.any() else 0.8
         if defect is None:
-            report["sides"][name] = {"status": "healthy", "stations": S, "depth_over_width": k_ref}
+            drift = _flatten_depth_drift(verts, verts_out, bi, b_idx, st, scale_h)
+            if drift is None:
+                report["sides"][name] = {"status": "healthy", "stations": S, "depth_over_width": k_ref}
+                continue
+            report["sides"][name] = {
+                "status": "rebuilt",
+                "reason": "depth drift",
+                "stations": S,
+                "depth_drift": round(float(drift["drift"]), 4),
+                "depth_drift_cm_on_170cm": round(float(drift["drift"] / scale_h * 170.0), 2),
+                "mesh_vertices_moved": int(drift["moved"]),
+            }
+            for s_ in range(int(ARM_DRIFT_MEASURE_RANGE[0] * S) - 4, int(ARM_DRIFT_MEASURE_RANGE[0] * S) + 5):
+                if 0 <= s_ < S:
+                    joins.append(np.r_[origin + st[s_, 0] * d + st[s_, 1] * n, drift["line"][s_]])
+            print(
+                f"[arm-rebuild] {name}: depth drift {drift['drift'] / scale_h * 170.0:+.1f} cm (170 cm body); "
+                f"forearm flattened onto the upper-arm line, {drift['moved']} verts moved",
+                flush=True,
+            )
             continue
         if defect < 5:
             report["sides"][name] = {"status": "defect_at_armpit_not_rebuilt", "stations": S, "reason": reason}
