@@ -91,6 +91,11 @@ class TestConfig:
     # ------------------------------------------------------------------ #
     mv_dump_dir: Optional[str] = None
     mv_inject_dir: Optional[str] = None
+    # Callback between the multiview diffusion and the carving (seed, 2026-10-05): the 12 carving inputs are
+    # written to <save_dir>/mv_callback/<scene>/ under the mv_dump names, `<mv_callback_cmd> <that dir>` runs, and
+    # whatever it wrote back there is carved, at its own size (square images are not resized: a callback may
+    # return 1024 px views). Also read from the MV_CALLBACK_CMD environment variable.
+    mv_callback_cmd: Optional[str] = None
     # Force back-view replacements
     force_back_image: Optional[str] = None  # path to back photo to force into 'back' color view
     force_back_normals_from_depthpro: bool = False
@@ -609,6 +614,24 @@ def _dump_mv_layers(dump_root: str, scene: str, view_names: List[str],
     print(f"[mv-dump] scene={scene}  wrote 12 layers + cond + sheet → {out_dir}")
 
 
+def _run_mv_callback(cmd: str, save_dir: str, scene: str, view_names: List[str], colors, normals):
+    """Hand the carving inputs to `cmd` and return what it wrote back (see TestConfig.mv_callback_cmd)."""
+    import shlex
+
+    out_dir = os.path.join(save_dir, "mv_callback", scene)
+    os.makedirs(out_dir, exist_ok=True)
+    for view, color, normal in zip(view_names, colors, normals):
+        color.save(os.path.join(out_dir, f"color_{view}_masked.png"))
+        normal.save(os.path.join(out_dir, f"normals_{view}_masked.png"))
+    print(f"[mv-callback] scene={scene}  running: {cmd} {out_dir}", flush=True)
+    subprocess.run(shlex.split(cmd) + [out_dir], check=True)
+    loaded = _try_load_injected_mv(out_dir, view_names, None)
+    if loaded is None:
+        raise RuntimeError(f"[mv-callback] {cmd} left no usable views in {out_dir}")
+    print(f"[mv-callback] scene={scene}  carving the callback's views ({loaded[0][0].size[0]} px)", flush=True)
+    return loaded
+
+
 def _try_load_injected_mv(inject_dir: str, view_names: List[str], crop_size: int):
     """Load 6 color + 6 normal RGBA PNGs from <inject_dir>/.
 
@@ -623,8 +646,14 @@ def _try_load_injected_mv(inject_dir: str, view_names: List[str], crop_size: int
         np_ = os.path.join(inject_dir, f"normals_{view}_masked.png")
         if not (os.path.isfile(cp) and os.path.isfile(np_)):
             return None
-        c_im = Image.open(cp).convert("RGBA").resize((crop_size, crop_size), Image.BILINEAR)
-        n_im = Image.open(np_).convert("RGBA").resize((crop_size, crop_size), Image.BILINEAR)
+        c_im = Image.open(cp).convert("RGBA")
+        n_im = Image.open(np_).convert("RGBA")
+        # Square views keep their resolution (ReMesh.preprocess resizes to recon_opt.resolution itself); shrinking
+        # them to crop_size threw away detail a 1024 px injected view carries.
+        if crop_size is not None and c_im.width != c_im.height:
+            c_im = c_im.resize((crop_size, crop_size), Image.BILINEAR)
+        if n_im.size != c_im.size:
+            n_im = n_im.resize(c_im.size, Image.BILINEAR)
         # Fallback alpha extraction if injected images are pure-RGB-with-bg.
         # Only rembg if alpha channel is fully opaque AND there's a non-white
         # background (heuristic: corner pixels not transparent).
@@ -887,6 +916,13 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                     if cfg.mv_dump_dir:
                         _dump_mv_layers(cfg.mv_dump_dir, scene, MV_VIEWS,
                                          colors, normals, img_in_)
+        callback = cfg.mv_callback_cmd or os.environ.get("MV_CALLBACK_CMD")
+        if callback:
+            # fails open: a host without the callback's models (Sapiens2, Z-Image) carves PSHuman's own views
+            try:
+                colors, normals = _run_mv_callback(callback, save_dir, scene, MV_VIEWS, colors, normals)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[mv-callback] scene={scene}  FAILED ({type(exc).__name__}: {exc}); carving PSHuman's own views", flush=True)
         pose = econdata.__getitem__(case_id)
         carving.optimize_case(scene, pose, colors, normals)
         torch.cuda.empty_cache()   
