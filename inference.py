@@ -918,11 +918,22 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                                          colors, normals, img_in_)
         callback = cfg.mv_callback_cmd or os.environ.get("MV_CALLBACK_CMD")
         if callback:
+            # The callback runs its own GPU models (Sapiens2, LightGlue, Real-ESRGAN) while this process waits. The
+            # diffusion pipeline is idle until the next scene, so it waits on the CPU and the cached diffusion blocks
+            # are released: on a 24 GB card they left the callback ~2 GB (suprim's 4090, 2026-10-05).
+            home = pipeline.unet.device
+            try:
+                pipeline.to("cpu")
+            except Exception as exc:  # noqa: BLE001 - only memory is at stake
+                print(f"[mv-callback] pipeline stays on {home}: {type(exc).__name__}: {exc}", flush=True)
+            torch.cuda.empty_cache()
             # fails open: a host without the callback's models (Sapiens2, Z-Image) carves PSHuman's own views
             try:
                 colors, normals = _run_mv_callback(callback, save_dir, scene, MV_VIEWS, colors, normals)
             except Exception as exc:  # noqa: BLE001
                 print(f"[mv-callback] scene={scene}  FAILED ({type(exc).__name__}: {exc}); carving PSHuman's own views", flush=True)
+            finally:
+                pipeline.to(home)
         pose = econdata.__getitem__(case_id)
         carving.optimize_case(scene, pose, colors, normals)
         torch.cuda.empty_cache()   
