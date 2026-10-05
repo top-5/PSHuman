@@ -140,6 +140,39 @@ _MV_VIEW_AZIMUTHS = {
 }
 
 
+def _resolve_external_helper(cfg, key: str, env_var: str, seed_relpath: str = "") -> Optional[str]:
+    """Resolve a path to a helper that lives outside this repository.
+
+    PSHuman must not know where its caller is checked out, so there is no
+    absolute default here. Precedence:
+
+    1. ``cfg.<key>`` -- set per project and forwarded by seed's run_pshuman.sh;
+    2. ``$<env_var>`` -- exported by that same runner;
+    3. ``$SEED_ROOT/<seed_relpath>`` -- for helpers that live inside seed.
+
+    Returns None when nothing resolves. Every caller already prints a
+    ``skipped:`` line and degrades when the path is missing, so an unset
+    runner simply turns the optional stage off instead of pointing at a
+    checkout that may not exist on this machine.
+    """
+    value = getattr(cfg, key, None) or os.environ.get(env_var)
+    if not value and seed_relpath:
+        seed_root = os.environ.get("SEED_ROOT")
+        if seed_root:
+            value = os.path.join(seed_root, seed_relpath)
+    return value or None
+
+
+def _helper_missing(path: Optional[str]) -> bool:
+    """True when an external helper is unset or not on disk.
+
+    ``_resolve_external_helper`` returns None when nothing is configured, so
+    the unset case has to be folded in here rather than handed to
+    ``os.path.exists``, which raises on None.
+    """
+    return not path or not os.path.exists(path)
+
+
 def _blend_depthpro_normals(
     colors: List,
     normals: List,
@@ -163,13 +196,14 @@ def _blend_depthpro_normals(
     """
     import numpy as np
 
-    flowier_py = getattr(cfg, 'flowier_python', None) or '/build/flowier/.venv/bin/python'
-    dp_script  = getattr(cfg, 'depthpro_normals_script', None) or '/build/seed/scripts/depthpro_normals.py'
+    flowier_py = _resolve_external_helper(cfg, 'flowier_python', 'SEED_FLOWIER_PYTHON')
+    dp_script  = _resolve_external_helper(cfg, 'depthpro_normals_script', 'SEED_DEPTHPRO_NORMALS_SCRIPT',
+                                          'scripts/depthpro_normals.py')
     thresh = float(getattr(cfg, 'depthpro_normals_blend_thresh', 0.3))
 
-    if not os.path.exists(flowier_py) or not os.path.exists(dp_script):
-        print(f'[depthpro-blend] skipped: py={flowier_py} exists={os.path.exists(flowier_py)} '
-              f'script={dp_script} exists={os.path.exists(dp_script)}', flush=True)
+    if _helper_missing(flowier_py) or _helper_missing(dp_script):
+        print(f'[depthpro-blend] skipped: py={flowier_py} missing={_helper_missing(flowier_py)} '
+              f'script={dp_script} missing={_helper_missing(dp_script)}', flush=True)
         return
 
     total_replaced = 0
@@ -431,15 +465,16 @@ def _upscale_mv_views(
     originals. RGBA is preserved (alpha is upscaled via the base.py split/merge
     path inside the upscaler).
     """
-    py = getattr(cfg, 'mv_upscale_python', None) or '/workspace/seed/.venv/bin/python3'
-    script = getattr(cfg, 'mv_upscale_script', None) or '/workspace/seed/scripts/realesrgan_mv_views.py'
+    py = _resolve_external_helper(cfg, 'mv_upscale_python', 'SEED_MV_UPSCALE_PYTHON', '.venv/bin/python3')
+    script = _resolve_external_helper(cfg, 'mv_upscale_script', 'SEED_MV_UPSCALE_SCRIPT',
+                                      'scripts/realesrgan_mv_views.py')
     ckpt = getattr(cfg, 'mv_upscale_ckpt', None)
     final_size = int(getattr(cfg, 'mv_upscale_final_size', 0) or 0)
     do_normals = bool(getattr(cfg, 'mv_normal_upscale', True))
 
-    if not os.path.exists(py) or not os.path.exists(script):
-        print(f'[mv-upscale] skipped: py={py} exists={os.path.exists(py)} '
-              f'script={script} exists={os.path.exists(script)}', flush=True)
+    if _helper_missing(py) or _helper_missing(script):
+        print(f'[mv-upscale] skipped: py={py} missing={_helper_missing(py)} '
+              f'script={script} missing={_helper_missing(script)}', flush=True)
         return
 
     with tempfile.TemporaryDirectory() as tdir:
@@ -786,9 +821,19 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                             print(f"[mv-force-back] back photo → tight-crop({w}x{h}) scale={scale:.4f} "
                                   f"→ {forced.width}x{forced.height} → padded {image_size}x{image_size} (image_size={image_size} crop_size={crop_size})")
                             # Optionally compute normals from depthpro on the forced back
-                            if cfg.force_back_normals_from_depthpro:
-                                py = cfg.flowier_python or "/build/flowier/.venv/bin/python"
-                                script = cfg.depthpro_normals_script or "/build/seed/scripts/depthpro_normals.py"
+                            py = _resolve_external_helper(cfg, 'flowier_python', 'SEED_FLOWIER_PYTHON')
+                            script = _resolve_external_helper(cfg, 'depthpro_normals_script',
+                                                              'SEED_DEPTHPRO_NORMALS_SCRIPT',
+                                                              'scripts/depthpro_normals.py')
+                            # The back photo is already in place; an unconfigured
+                            # normals helper skips only this optional refinement,
+                            # it must not fail the replacement above.
+                            if cfg.force_back_normals_from_depthpro and (
+                                _helper_missing(py) or _helper_missing(script)
+                            ):
+                                print(f'[mv-force-back] depthpro normals skipped: '
+                                      f'py={py} script={script}', flush=True)
+                            elif cfg.force_back_normals_from_depthpro:
                                 with tempfile.TemporaryDirectory() as tdir:
                                     rgb_path = os.path.join(tdir, 'back_rgb.png')
                                     mask_path = os.path.join(tdir, 'back_mask.png')
