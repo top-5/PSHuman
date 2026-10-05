@@ -157,10 +157,32 @@ def _resolve_external_helper(cfg, key: str, env_var: str, seed_relpath: str = ""
     """
     value = getattr(cfg, key, None) or os.environ.get(env_var)
     if not value and seed_relpath:
-        seed_root = os.environ.get("SEED_ROOT")
+        seed_root = os.environ.get("SEED_ROOT") or _vendored_seed_root()
         if seed_root:
             value = os.path.join(seed_root, seed_relpath)
     return value or None
+
+
+def _vendored_seed_root() -> Optional[str]:
+    """Seed's root inferred from where this checkout physically sits.
+
+    PSHuman is vendored at <seed>/external/PSHuman, so parents[2] of this file
+    is seed's root. This is the last resort, after the config key, the env var
+    and $SEED_ROOT.
+
+    It exists for version skew. This submodule can be advanced independently of
+    seed, so a host can end up running a PSHuman that expects the SEED_* exports
+    against a seed whose run_pshuman.sh predates them. Without this fallback
+    that combination resolves to None and the 6-view upscale *silently skips* --
+    worse than the absolute path this replaced, which happened to be right on
+    hosts checked out at that path. Reported by rainbow-claude, 2026-10-05.
+
+    Returns None when this file is not inside a seed checkout (a standalone
+    clone, or SEED_PSHUMAN_REPO pointing elsewhere), so a wrong guess degrades
+    to the same skip rather than to a confidently bogus path.
+    """
+    root = Path(__file__).resolve().parents[2]
+    return str(root) if (root / "src" / "seed").is_dir() else None
 
 
 def _helper_missing(path: Optional[str]) -> bool:
