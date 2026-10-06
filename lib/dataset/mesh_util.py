@@ -1620,6 +1620,12 @@ ARM_WINDOW_STATIONS = 2
 ARM_SEED_LATERAL_FRACTION = 0.6
 #: Walking inward, a cross-section this many times wider than the recent median has hit the torso.
 ARM_TORSO_MERGE_RATIO = 2.2
+#: ...but only this close to the body: a station farther out than this fraction of the side's lateral extent is
+#: in the hand or forearm, where the cross-section also widens (the thumb joining the palm). alena-bikini
+#: 2026-10-06: the left walk took the thumb (2.5x wider, 91% of the way out) for the armpit and stopped after 25
+#: stations of fingers, so `rebuild_arms_from_front_mask` never reached the broken forearm ("no_distal_surface")
+#: and the wrist graft welded a hand onto it. The right arm's armpit stop sits at 30%.
+ARM_TORSO_MERGE_MAX_LATERAL = 0.6
 #: Two depth groups at one station are separate surfaces when this far apart, as a fraction of the
 #: local half-width (floored at ARM_DEPTH_GAP_SCALE_FRACTION of the body extent).
 ARM_DEPTH_GAP_FRACTION = 0.3
@@ -1721,7 +1727,9 @@ def _arm_stations(mask, ortho_scale, side, cx):
         half = 0.5 * (wgrid[b] - wgrid[a] + px)
         if len(stations) > 15:
             recent = np.median([s[2] for s in stations[-15:]])
-            if half > ARM_TORSO_MERGE_RATIO * recent or a == 0 or b == len(wgrid) - 1:
+            centre = origin + t * d + 0.5 * (wgrid[a] + wgrid[b]) * n
+            near_body = side * (centre[0] - cx) <= ARM_TORSO_MERGE_MAX_LATERAL * float(lat.max())
+            if (near_body and half > ARM_TORSO_MERGE_RATIO * recent) or a == 0 or b == len(wgrid) - 1:
                 break
         w_prev = 0.5 * (wgrid[a] + wgrid[b])
         stations.append((t, w_prev, half))
