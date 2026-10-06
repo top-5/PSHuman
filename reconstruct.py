@@ -85,6 +85,30 @@ def _load_smpl_prior_npz(path, device, dtype):
     }
 
 
+def _outer_surface(vertices, faces):
+    """The largest face-connected piece of a mesh, compacted: the SMPL-X body without its two eyeballs (separate
+    546-vertex spheres in the eye sockets). Carved from with them, the remesher folded each eyeball into the eyelids
+    and left a crumpled patch on both eyes (alena-bikini, 2026-10-05). Returns (vertices, faces, kept vertex ids)."""
+    import scipy.sparse as sp
+    from scipy.sparse.csgraph import connected_components
+
+    f = faces.detach().cpu().numpy()
+    n = int(vertices.shape[0])
+    e = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]])
+    graph = sp.coo_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])), shape=(n, n))
+    _, label = connected_components(graph, directed=False)
+    used = np.zeros(n, bool)
+    used[f.ravel()] = True
+    counts = np.bincount(label[used], minlength=label.max() + 1)
+    keep = (label == int(np.argmax(counts))) & used
+    remap = -np.ones(n, np.int64)
+    remap[keep] = np.arange(int(keep.sum()))
+    f_keep = remap[f]
+    f_keep = f_keep[(f_keep >= 0).all(axis=1)]
+    ids = torch.as_tensor(np.flatnonzero(keep), device=vertices.device)
+    return vertices.index_select(0, ids), torch.as_tensor(f_keep, device=faces.device, dtype=faces.dtype), ids
+
+
 def _placement_from_vertices(v_raw, v_target):
     """(scale, offset) with (v_raw + offset) * scale * 2 ~= v_target in least squares, no rotation: the placement that
     reproduces a body already fitted in this camera frame (seed's SMPL-X fit), instead of `scale_mesh`'s own-bounding-
@@ -2167,7 +2191,10 @@ class ReMesh:
             masks = masks_original
             target_normals = target_normals_original
 
-        nrm_opt = MeshOptimizer(v_smpl.detach(), self.smplx_face.detach(), edge_len_lims=[0.01, 0.1])
+        carve_v, carve_f, _ = _outer_surface(v_smpl.detach(), self.smplx_face.detach())
+        print(f"[carve] start: the SMPL-X outer surface, {int(carve_v.shape[0])} of {int(v_smpl.shape[0])} vertices "
+              "(eyeballs dropped)", flush=True)
+        nrm_opt = MeshOptimizer(carve_v, carve_f, edge_len_lims=[0.01, 0.1])
         # ------------------------------------------------------------------
         # Optional: replace the SMPL-X mesh initializer with a front-silhouette
         # slab.  Enabled via PSHUMAN_SLAB_INIT=1.
