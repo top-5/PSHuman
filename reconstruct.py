@@ -72,13 +72,100 @@ def _load_smpl_prior_npz(path, device, dtype):
             return None
         return torch.as_tensor(np.asarray(data[name], dtype=np.float32), device=device, dtype=dtype)
 
+    v_smpl = tensor("v_smpl")
     return {
         "path": path,
         "betas": tensor("betas"),
         "global_orient_6d": tensor("global_orient_6d"),
         "body_pose_6d": tensor("body_pose_6d"),
         "trans": tensor("trans"),
+        # the prior's own vertices, in THIS camera frame (seed fits them against the carved mesh, which lives in it):
+        # they fix where and how big the body stands (`_placement_from_vertices`)
+        "v_smpl": v_smpl.reshape(-1, 3) if v_smpl is not None else None,
     }
+
+
+def _placement_from_vertices(v_raw, v_target):
+    """(scale, offset) with (v_raw + offset) * scale * 2 ~= v_target in least squares, no rotation: the placement that
+    reproduces a body already fitted in this camera frame (seed's SMPL-X fit), instead of `scale_mesh`'s own-bounding-
+    box normalisation. Returns (scale, offset, per-vertex residual)."""
+    a, b = v_raw, v_target * 0.5
+    am, bm = a.mean(0), b.mean(0)
+    s = ((a - am) * (b - bm)).sum() / ((a - am) ** 2).sum().clamp_min(1e-12)
+    offset = (bm - s * am) / s
+    residual = torch.linalg.norm((a + offset) * s * 2 - v_target, dim=1)
+    return s, offset, residual
+
+
+def _below_head_rows(head_alpha, body_alpha, margin):
+    """Per view, a (H, 1) mask of the image rows on the far side of the SMPL-X head's lowest row (the chin) from the
+    head: the rows where the body, not hair, makes the silhouette."""
+    keep = torch.ones(head_alpha.shape[:2] + (1,), device=head_alpha.device, dtype=torch.bool)
+    rows = torch.arange(head_alpha.shape[1], device=head_alpha.device)
+    for vi in range(head_alpha.shape[0]):
+        h = (head_alpha[vi, ..., 0] > 0.5).any(dim=1)
+        b = (body_alpha[vi, ..., 0] > 0.5).any(dim=1)
+        if not h.any() or not b.any():
+            continue
+        hr, br = rows[h].float(), rows[b].float()
+        if hr.mean() < br.mean():  # the head at low row indices
+            keep[vi, :, 0] = rows > hr.max() + margin
+        else:
+            keep[vi, :, 0] = rows < hr.min() - margin
+    return keep
+
+
+def _sweep_placement(renderer, v_raw, faces, head_faces, scale, offset, target_masks, view_ids, steps=(0.04, 0.08),
+                     rounds=7):
+    """Refine the body's placement in the camera (one scale and a 3D shift) by a coarse-to-fine pattern search on the
+    silhouettes of `view_ids` (front, back: scale and x/y; the sides: depth), counting only the rows below the SMPL-X
+    head so hair does not size a bald body. Each parameter is tried one step either way, the best kept, and the step
+    halved when nothing improves (a per-axis bisection). Returns (scale, offset, report)."""
+    _normals = calc_vertex_normals
+    views = torch.as_tensor(view_ids, device=v_raw.device, dtype=torch.long)
+    target = target_masks.index_select(0, views)[..., :1] > 0.5
+    rows_margin = max(2, int(0.01 * target.shape[1]))
+
+    def place(p):
+        m, d = torch.exp(torch.as_tensor(p[0], device=v_raw.device)), torch.as_tensor(p[1:], device=v_raw.device, dtype=v_raw.dtype)
+        return (v_raw + offset) * scale * 2 * m + d
+
+    def score(p):
+        v = place(p)
+        with torch.no_grad():
+            body = renderer.render(v, faces, normals=_normals(v, faces))[..., 3:].index_select(0, views)
+            head = renderer.render(v, head_faces, normals=_normals(v, faces))[..., 3:].index_select(0, views)
+        keep = _below_head_rows(head, body, rows_margin)
+        pred = (body > 0.5) & keep.unsqueeze(2)
+        tgt = target & keep.unsqueeze(2)
+        inter = (pred & tgt).flatten(1).sum(1).float()
+        union = (pred | tgt).flatten(1).sum(1).float().clamp_min(1.0)
+        return float((inter / union).mean())
+
+    p = [0.0, 0.0, 0.0, 0.0]
+    best = start = score(p)
+    step = [steps[0], steps[1], steps[1], steps[1]]
+    evaluations = 1
+    for _ in range(rounds):
+        improved = False
+        for k in range(4):
+            for sign in (1.0, -1.0):
+                q = list(p)
+                q[k] += sign * step[k]
+                sc = score(q)
+                evaluations += 1
+                if sc > best + 1e-5:
+                    best, p, improved = sc, q, True
+                    break
+        if not improved:
+            step = [x * 0.5 for x in step]
+    m = float(np.exp(p[0]))
+    new_scale = scale * m
+    new_offset = offset + torch.as_tensor(p[1:], device=v_raw.device, dtype=v_raw.dtype) / (2 * new_scale)
+    report = {"iou_below_head_before": round(start, 4), "iou_below_head_after": round(best, 4),
+              "scale_factor": round(m, 4), "shift": [round(float(x), 4) for x in p[1:]], "evaluations": evaluations,
+              "views": [int(v) for v in view_ids]}
+    return new_scale, new_offset, report
 
 
 def _copy_partial_(target, source):
@@ -132,6 +219,11 @@ def _load_smplx_anatomy_ids():
         path = os.path.join(partial_dir, f"{name}.npz")
         if os.path.exists(path):
             out[name] = np.load(path)["vids"].astype(np.int64).reshape(-1)
+
+    seg_x = os.path.join(root, "smpl_related", "smplx_vert_segmentation.json")
+    if os.path.exists(seg_x):
+        with open(seg_x, "r") as f:
+            out["smplxseg_head"] = np.asarray(json.load(f).get("head", []), dtype=np.int64).reshape(-1)
 
     seg_path = os.path.join(root, "smpl_related", "smpl_vert_segmentation.json")
     if os.path.exists(seg_path):
@@ -1350,6 +1442,12 @@ class ReMesh:
             (12, 13), (15, 16), (17, 18), (19, 20),
         )
 
+        # ...and the midline joints (spine1-3, neck, head: 2, 5, 8, 11, 14) onto their own mirror image: no twist or
+        # sideways lean. They are frozen at their start under hard symmetry, so a start that turned the head (seed's
+        # fit of alena-bikini: 4.8 deg) would otherwise stay turned for the whole fit and the carve
+        smpl_symmetric_midline = _env_bool("PSHUMAN_SMPL_SYMMETRIC_MIDLINE", smpl_hard_symmetry)
+        _MIDLINE_6D = (2, 5, 8, 11, 14)
+
         def _project_body_pose_symmetric(pose_tensor: torch.Tensor) -> None:
             """In-place project body_pose 6D to bilaterally symmetric subspace."""
             pose_flat = pose_tensor.view(-1, 6)
@@ -1366,7 +1464,27 @@ class ReMesh:
                 sym_left = (left + right * sign) * 0.5
                 pose_flat[li] = sym_left
                 pose_flat[ri] = sym_left * sign
+            if smpl_symmetric_midline:
+                for mi in _MIDLINE_6D:
+                    if mi < pose_flat.shape[0]:
+                        pose_flat[mi] = (pose_flat[mi] + pose_flat[mi] * sign) * 0.5
 
+        def _pose_mirror_residual(pose_tensor: torch.Tensor) -> dict:
+            """How far a body pose is from its own mirror image: per joint, the angle (deg) between it and its
+            bilaterally symmetric projection."""
+            with torch.no_grad():
+                sym = pose_tensor.detach().clone()
+                _project_body_pose_symmetric(sym)
+                a = rot6d_to_rotmat(pose_tensor.detach().reshape(-1, 6))
+                b = rot6d_to_rotmat(sym.reshape(-1, 6))
+                rel = a.transpose(-1, -2) @ b
+                cos = ((rel.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) * 0.5).clamp(-1.0, 1.0)
+                ang = torch.rad2deg(torch.arccos(cos))
+            return {"max_deg": round(float(ang.max()), 3), "mean_deg": round(float(ang.mean()), 3),
+                    "worst_joint": int(torch.argmax(ang))}
+
+        smpl_symmetry = {"hard_symmetry": bool(smpl_hard_symmetry), "symmetric_midline": bool(smpl_symmetric_midline),
+                         "start_pose_mirror": _pose_mirror_residual(optimed_pose)}
         if smpl_hard_symmetry:
             with torch.no_grad():
                 _project_body_pose_symmetric(optimed_pose)
@@ -1518,7 +1636,30 @@ class ReMesh:
             )
             _pre_verts = _pre_verts + optimed_trans
             v_smpl_init = torch.matmul(torch.matmul(_pre_verts.squeeze(0), rz.T), ry.T)
+            # PLACEMENT: where and how big the SMPL-X stands in the cameras. `scale_mesh` sizes the body by its own
+            # bounding sphere, while the input photo was sized by its silhouette's box (hair included), and nothing
+            # related the two: alena-bikini's bald SMPL-X stood 5% taller than her silhouette with hair, feet ~7 cm
+            # low (2026-10-05). A seeded run takes the prior's own vertices (seed's fit, made against the carved mesh
+            # in this frame); every run then registers the placement to the front/back/side silhouettes below the head
             scale, offset = scale_mesh(v_smpl_init)
+            smpl_placement = {"method": "bbox_sphere", "scale_mesh": [float(scale), [float(x) for x in offset]]}
+            placement_mode = os.environ.get("PSHUMAN_SMPL_PLACEMENT", "auto").strip().lower()
+            prior_v = smpl_prior.get("v_smpl") if (smpl_prior is not None and smpl_init_from_prior) else None
+            if placement_mode != "bbox" and prior_v is not None and prior_v.shape[0] == v_smpl_init.shape[0]:
+                scale, offset, residual = _placement_from_vertices(v_smpl_init, prior_v)
+                smpl_placement.update({"method": "prior_vertices", "residual_median": float(residual.median()),
+                                       "residual_p95": float(torch.quantile(residual, 0.95))})
+            head_ids = smpl_anatomy_ids.get("smplxseg_head")
+            if placement_mode != "bbox" and _env_bool("PSHUMAN_SMPL_PLACEMENT_SWEEP", True) and head_ids is not None:
+                head_v = torch.zeros(v_smpl_init.shape[0], dtype=torch.bool, device=self.device)
+                head_v[head_ids] = True
+                head_faces = self.smplx_face[head_v[self.smplx_face].all(dim=1)]
+                view_ids = [self.views.index(v) for v in ("front_face", "back", "right", "left") if v in self.views]
+                scale, offset, sweep = _sweep_placement(self.renderer, v_smpl_init, self.smplx_face, head_faces, scale,
+                                                        offset, masks, view_ids)
+                smpl_placement["sweep"] = sweep
+            smpl_placement.update({"scale": float(scale), "offset": [float(x) for x in offset]})
+            print(f"[smpl-fit] placement {json.dumps(smpl_placement)}", flush=True)
             v_smpl_init = (v_smpl_init + offset) * scale * 2
 
         if self.xview_mode == "smplx_silhouette":
@@ -1790,6 +1931,29 @@ class ReMesh:
                     masks[vi],
                 )
             front_silhouette = per_view_silhouette.get("front_face", _silhouette_fit_metrics(fit_render[0, ..., 3:], masks[0]))
+            # CENTRING in the front camera, below the head (hair does not count): how far the body's silhouette stands
+            # from the photo's, across and in height, in pixels; and its IoU there
+            smpl_centring = {}
+            head_ids_r = smpl_anatomy_ids.get("smplxseg_head")
+            if head_ids_r is not None:
+                with torch.no_grad():
+                    hv = torch.zeros(v_smpl.shape[0], dtype=torch.bool, device=self.device)
+                    hv[head_ids_r] = True
+                    hf = self.smplx_face[hv[self.smplx_face].all(dim=1)]
+                    head_render = self.renderer.render(v_smpl, hf, normals=fit_normals)[..., 3:]
+                    keep = _below_head_rows(head_render[:1], fit_render[:1, ..., 3:], 2)[0]
+                    pred = (fit_render[0, ..., 3] > 0.5) & keep
+                    tgt = (masks[0, ..., 0] > 0.5) & keep
+                    cols = torch.arange(pred.shape[1], device=self.device, dtype=torch.float32)
+                    rows = torch.arange(pred.shape[0], device=self.device, dtype=torch.float32)
+                    if pred.any() and tgt.any():
+                        pr, tr = rows[pred.any(dim=1)], rows[tgt.any(dim=1)]
+                        smpl_centring = {
+                            "front_centre_x_px": round(float((pred.float() * cols).sum() / pred.sum() - (tgt.float() * cols).sum() / tgt.sum()), 2),
+                            "front_rows_below_head_px": [int(pr.numel()), int(tr.numel())],
+                            "front_extent_rows_px": [[int(pr.min()), int(pr.max())], [int(tr.min()), int(tr.max())]],
+                            "front_iou_below_head": round(float((pred & tgt).sum() / (pred | tgt).sum()), 4),
+                        }
             mean_silhouette_iou = float(np.mean([m["iou"] for m in per_view_silhouette.values()])) if per_view_silhouette else 0.0
             mean_silhouette_bbox_iou = float(np.mean([m["bbox_iou"] for m in per_view_silhouette.values()])) if per_view_silhouette else 0.0
             beta_delta = (optimed_betas.detach() - beta_initial).abs()
@@ -1807,6 +1971,9 @@ class ReMesh:
                     "active_beta_delta_max": float(beta_delta[..., :smpl_active_betas].max().cpu()) if smpl_active_betas else 0.0,
                     "inactive_beta_delta_max": float(beta_delta[..., smpl_active_betas:].max().cpu()) if smpl_active_betas < optimed_betas.shape[-1] else 0.0,
                 },
+                "placement": smpl_placement,
+                "centring": smpl_centring,
+                "symmetry": {**smpl_symmetry, "final_pose_mirror": _pose_mirror_residual(optimed_pose)},
                 "silhouette_fit": {
                     "threshold": 0.5,
                     "score": front_silhouette["iou"],
