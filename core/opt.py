@@ -1,7 +1,7 @@
 from copy import deepcopy
 import time
 import torch
-import torch_scatter
+from core.deterministic_scatter import scatter_mean as _deterministic_scatter_mean
 from core.remesh import calc_edge_length, calc_edges, calc_face_collapses, calc_face_normals, calc_vertex_normals, collapse_edges, flip_edges, pack, prepend_dummies, remove_dummies, split_edges
 
 @torch.no_grad()
@@ -136,7 +136,7 @@ class MeshOptimizer:
         E = edges.shape[0]
         edge_smooth = self._smooth[edges] #E,2,S
         neighbor_smooth = torch.zeros_like(self._smooth) #V,S
-        torch_scatter.scatter_mean(src=edge_smooth.flip(dims=[1]).reshape(E*2,-1),index=edges.reshape(E*2,1),dim=0,out=neighbor_smooth)
+        _deterministic_scatter_mean(src=edge_smooth.flip(dims=[1]).reshape(E*2,-1),index=edges.reshape(E*2,1),dim=0,out=neighbor_smooth)
         #apply optional smoothing of m1,m2,nu
         if self._gammas[0]:
             self._m1.lerp_(neighbor_smooth[:,5:8],self._gammas[0])
