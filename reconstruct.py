@@ -1730,6 +1730,29 @@ class ReMesh:
             v_smpl = (v_smpl + offset) * scale * 2
             # if i == 0:
             #   save_mesh(f'{case_path}/{case}_init_smpl.obj', v_smpl, self.smplx_face)
+
+            # DIAGNOSTIC (rainbow-claude, 2026-10-09, armpit-wing arm-axis investigation): the fleet-wide
+            # shoulder/arm-axis bias (suprim-claude's audit) could be baked in before global_orient is even
+            # frozen, or introduced later by the optimizer despite the freeze. Dump the i==0 state -- the
+            # first joints/mesh computed AFTER smpl_freeze_orient takes effect (orient.requires_grad_(False)
+            # runs before this loop starts) but BEFORE any optimizer.step() -- so it can be compared
+            # against the final smplx_fit_mesh.obj with the same cross-section method as
+            # suprim's ~/scratch/neckcap/arm_axis.py. Zero effect unless explicitly enabled; no default env
+            # var is set anywhere in seed's own pipeline.
+            if i == 0 and _env_bool("PSHUMAN_SMPL_ORIENT_DEBUG_DUMP", False):
+                _dbg_dir = f'{case_path}/smpl_fit'
+                os.makedirs(_dbg_dir, exist_ok=True)
+                with torch.no_grad():
+                    save_mesh(f'{_dbg_dir}/orient_debug_init_smpl.obj', v_smpl, self.smplx_face)
+                    np.savez(
+                        f'{_dbg_dir}/orient_debug_init.npz',
+                        global_orient_6d=optimed_orient.detach().cpu().numpy(),
+                        global_orient_matrix=optimed_orient_mat.detach().cpu().numpy(),
+                        joints=smpl_joints.detach().cpu().numpy(),
+                        freeze_global_orient=bool(smpl_freeze_orient),
+                        freeze_head_neck=bool(smpl_freeze_head_neck),
+                        hard_symmetry=bool(smpl_hard_symmetry),
+                    )
             # exit()
             normals = calc_vertex_normals(v_smpl, self.smplx_face)
             nrm = self.renderer.render(v_smpl, self.smplx_face, normals=normals)
