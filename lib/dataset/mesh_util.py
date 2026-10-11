@@ -1775,6 +1775,14 @@ def _flatten_depth_drift(verts, verts_out, bi, b_idx, st, height):
     the depth centreline from the upper-arm line, applied from mid-arm outward and held constant
     past the measure range so the hand moves with the wrist rather than being reshaped.
     """
+    if os.environ.get("PSHUMAN_ARM_DRIFT_FLATTEN", "0") != "1":
+        # OFF BY DEFAULT (owner downvote 2026-10-11, syn-jasper "arm disjoint into two pieces"): a naturally bent
+        # forearm read as a 5.5 cm drift was moved onto the upper-arm line, leaving a hard step at the elbow (the
+        # remeshed arm before it was continuous). Pipeline A/B on suprim, flatten off: syn-jasper fixed, thia (drift
+        # +5.9/+4.9) continuous where it had an elbow step, syn-laro / alena-nude / bald-european unchanged. The
+        # motivating 2026-10-02 cases no longer drift; real breaks still take the defect path below.
+        # PSHUMAN_ARM_DRIFT_FLATTEN=1 restores the old behaviour.
+        return None
     S = len(st)
     c = np.full(S, np.nan)
     for s in range(S):
