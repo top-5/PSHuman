@@ -1775,6 +1775,10 @@ def _flatten_depth_drift(verts, verts_out, bi, b_idx, st, height):
     the depth centreline from the upper-arm line, applied from mid-arm outward and held constant
     past the measure range so the hand moves with the wrist rather than being reshaped.
     """
+    if os.environ.get("PSHUMAN_ARM_DRIFT_FLATTEN", "1") == "0":
+        # A/B switch (owner 2026-10-11, syn-jasper "arm disjoint into two pieces"): a naturally bent forearm read as a
+        # 5.5 cm drift was moved onto the upper-arm line, leaving a hard step at the elbow. "0" leaves every arm as is.
+        return None
     S = len(st)
     c = np.full(S, np.nan)
     for s in range(S):
