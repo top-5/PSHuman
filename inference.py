@@ -62,13 +62,13 @@ class TestConfig:
     num_views: int
     enable_xformers_memory_efficient_attention: bool
     with_smpl: Optional[bool]
-    #: seed (owner 2026-10-12): the sampler. None keeps the checkpoint's DDIM; "dpmpp" = DPM-Solver++ (2M), "euler_a".
-    scheduler: Optional[str] = None
     
     recon_opt: Dict
     prompt: Optional[str] = None
     color_prompt: Optional[str] = None
     normal_prompt: Optional[str] = None
+    #: seed (owner 2026-10-12): the sampler. None keeps the checkpoint's DDIM; "dpmpp" = DPM-Solver++ (2M), "euler_a".
+    scheduler: Optional[str] = None
 
     # ------------------------------------------------------------------ #
     # Multi-view I/O hooks (added so we can study / replace the diffusion
