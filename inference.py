@@ -62,6 +62,8 @@ class TestConfig:
     num_views: int
     enable_xformers_memory_efficient_attention: bool
     with_smpl: Optional[bool]
+    #: seed (owner 2026-10-12): the sampler. None keeps the checkpoint's DDIM; "dpmpp" = DPM-Solver++ (2M), "euler_a".
+    scheduler: Optional[str] = None
     
     recon_opt: Dict
     prompt: Optional[str] = None
@@ -965,6 +967,14 @@ def load_pshuman_pipeline(cfg):
         pipeline.enable_vae_slicing()
     if hasattr(pipeline, 'enable_vae_tiling'):
         pipeline.enable_vae_tiling()
+    if getattr(cfg, 'scheduler', None):
+        from diffusers import DPMSolverMultistepScheduler, EulerAncestralDiscreteScheduler
+        kind = str(cfg.scheduler).lower()
+        if kind == 'dpmpp':
+            pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config, algorithm_type='dpmsolver++')
+        elif kind == 'euler_a':
+            pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config)
+        print(f"[seed] multiview diffusion scheduler: {type(pipeline.scheduler).__name__}", flush=True)
     if torch.cuda.is_available():
         pipeline.to('cuda')
     return pipeline
