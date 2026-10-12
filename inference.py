@@ -1,4 +1,6 @@
+import seed_spans  # first: its import time is the process start (seed trace spans)
 import argparse
+import time
 import os
 import sys
 from typing import Dict, Optional, Tuple, List
@@ -743,7 +745,8 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                 colors_inj, normals_inj = inject_loaded
                 print(f"[mv-inject] scene={scene}  loaded 6+6 RGBA from {inject_dir}")
                 pose = econdata.__getitem__(case_id)
-                carving.optimize_case(scene, pose, colors_inj, normals_inj)
+                with seed_spans.span("pshuman: reconstruct (SMPL fit + mesh)", views="injected"):
+                    carving.optimize_case(scene, pose, colors_inj, normals_inj)
                 torch.cuda.empty_cache()
                 continue
             else:
@@ -770,6 +773,7 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
         with torch.autocast("cuda"):
             # B*Nv images
             guidance_scale = cfg.validation_guidance_scales
+            _diff_t0 = time.time_ns()
             unet_out = pipeline(
                 imgs_in, None, prompt_embeds=prompt_embeddings,
                 dino_feature=None, smpl_in=smpl_in,
@@ -778,6 +782,8 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
             )
             
             out = unet_out.images
+            torch.cuda.synchronize()
+            seed_spans.emit("pshuman: multiview diffusion", _diff_t0, time.time_ns(), views=int(out.shape[0] // 2))
             bsz = out.shape[0] // 2
 
             normals_pred = out[:bsz]
@@ -935,7 +941,8 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
             finally:
                 pipeline.to(home)
         pose = econdata.__getitem__(case_id)
-        carving.optimize_case(scene, pose, colors, normals)
+        with seed_spans.span("pshuman: reconstruct (SMPL fit + mesh)"):
+            carving.optimize_case(scene, pose, colors, normals)
         torch.cuda.empty_cache()   
                
      
@@ -969,7 +976,9 @@ def main(
     # If passed along, set the training seed now.
     if cfg.seed is not None:
         set_seed(cfg.seed)
-    pipeline = load_pshuman_pipeline(cfg)
+    seed_spans.emit("pshuman: python start + imports", seed_spans.PROCESS_T0_NS, time.time_ns())
+    with seed_spans.span("pshuman: load diffusion pipeline"):
+        pipeline = load_pshuman_pipeline(cfg)
     
 
     if cfg.with_smpl:
@@ -985,9 +994,9 @@ def main(
         validation_dataset, batch_size=cfg.validation_batch_size, shuffle=False, num_workers=cfg.dataloader_num_workers
     )
     dataset_param = {'image_dir': validation_dataset.root_dir, 'seg_dir': None, 'colab': False, 'has_det': True, 'hps_type': 'pixie'}
-    econdata = SMPLDataset(dataset_param, device='cuda')
-
-    carving = ReMesh(cfg.recon_opt, econ_dataset=econdata)
+    with seed_spans.span("pshuman: load SMPL data + reconstructor"):
+        econdata = SMPLDataset(dataset_param, device='cuda')
+        carving = ReMesh(cfg.recon_opt, econ_dataset=econdata)
     run_inference(validation_dataloader, econdata, pipeline, carving, cfg, cfg.save_dir)
    
 
