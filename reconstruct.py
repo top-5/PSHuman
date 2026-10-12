@@ -2512,6 +2512,10 @@ class ReMesh:
         
 
     def evaluate(self, target_vertices, target_colors, target_faces, save_path=None, save_nrm=False):
+        # seed sets PSHUMAN_TURNTABLE=0 on its first pass (owner 2026-10-12): nothing reads that pass's turntable MP4,
+        # and the 60-view render plus the libx264 encode only cost time
+        if save_path is not None and os.environ.get("PSHUMAN_TURNTABLE", "1") == "0":
+            return []
         mv, proj = make_round_views(60, self.opt.scale, device=self.device)
         renderer = NormalsRenderer(mv, proj, [512, 512], device=self.device)
         
