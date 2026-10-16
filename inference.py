@@ -1,7 +1,10 @@
 import seed_spans  # first: its import time is the process start (seed trace spans)
+import no_smplx  # SEED_NO_SMPLX=1 (a seed SOMA run) refuses SMPL-X in this process
+no_smplx.install()
 import argparse
 import time
 import os
+import numpy as np
 import sys
 from typing import Dict, Optional, Tuple, List
 from omegaconf import OmegaConf
@@ -721,6 +724,60 @@ def build_prompt_embeddings(pipeline, num_views: int, cfg: TestConfig) -> Option
 
     return _encode(normal_prompts), _encode(color_prompts)
 
+def _soma_body() -> bool:
+    return os.environ.get("PSHUMAN_BODY_MODEL", "smplx").strip().lower() == "soma"
+
+
+class SomaCases:
+    """The dataset ReMesh reads when the body is seed's SOMA prior (PSHUMAN_BODY_MODEL=soma): the prior's faces, and
+    per case an empty pose (reconstruct._soma_hands_visibility then treats both hands as visible)."""
+
+    def __init__(self):
+        prior = os.environ.get("PSHUMAN_BODY_PRIOR_NPZ", "")
+        if not prior and not os.environ.get("PSHUMAN_SOMA_FIT_CMD"):
+            raise ValueError("PSHUMAN_BODY_MODEL=soma needs PSHUMAN_BODY_PRIOR_NPZ (the SOMA body fitted by seed) or "
+                             "PSHUMAN_SOMA_FIT_CMD (seed fits one to the views)")
+        # ReMesh keeps these as its default faces; the SOMA path replaces them with the prior's per case
+        self.faces = np.load(prior)["faces"].astype(np.int64) if prior else np.zeros((1, 3), np.int64)
+        print(f"[soma] no HPS: body prior {prior or 'fitted to the views by PSHUMAN_SOMA_FIT_CMD'}", flush=True)
+
+    def __getitem__(self, index):
+        return {}
+
+
+def _soma_views_prior(save_dir: str, scene: str, view_names: List[str], colors, normals, pipeline=None) -> None:
+    """PSHUMAN_BODY_MODEL=soma without a prior (the first pass): seed fits SOMA to these views (PSHUMAN_SOMA_FIT_CMD
+    <views_dir> <out.npz>) and the carve starts from that body (PSHUMAN_BODY_PRIOR_NPZ)."""
+    import shlex
+
+    cmd = os.environ.get("PSHUMAN_SOMA_FIT_CMD", "")
+    if not _soma_body() or os.environ.get("PSHUMAN_BODY_PRIOR_NPZ") or not cmd:
+        return
+    views_dir = os.path.join(save_dir, "soma_views", scene)
+    os.makedirs(views_dir, exist_ok=True)
+    for view, color, normal in zip(view_names, colors, normals):
+        color.save(os.path.join(views_dir, f"color_{view}_masked.png"))
+        normal.save(os.path.join(views_dir, f"normals_{view}_masked.png"))
+    out = os.path.join(views_dir, "soma_body_prior.npz")
+    print(f"[soma] scene={scene}  fitting SOMA to the views: {cmd} {views_dir} {out}", flush=True)
+    # seed's fit runs on the GPU while this process waits: the idle diffusion pipeline waits on the CPU, as for the
+    # mv callback (on seeker the fit went out of memory beside it and the shared vLLM/Z-Image services)
+    home = pipeline.unet.device if pipeline is not None else None
+    if pipeline is not None:
+        try:
+            pipeline.to("cpu")
+        except Exception as exc:  # noqa: BLE001 - only memory is at stake
+            print(f"[soma] pipeline stays on {home}: {type(exc).__name__}: {exc}", flush=True)
+        torch.cuda.empty_cache()
+    try:
+        with seed_spans.span("pshuman: SOMA body from the views (seed)"):
+            subprocess.run(shlex.split(cmd) + [views_dir, out], check=True)
+    finally:
+        if pipeline is not None:
+            pipeline.to(home)
+    os.environ["PSHUMAN_BODY_PRIOR_NPZ"] = out
+
+
 def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  save_dir):
     pipeline.set_progress_bar_config(disable=True)
 
@@ -746,6 +803,7 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
             if inject_loaded is not None:
                 colors_inj, normals_inj = inject_loaded
                 print(f"[mv-inject] scene={scene}  loaded 6+6 RGBA from {inject_dir}")
+                _soma_views_prior(save_dir, scene, MV_VIEWS, colors_inj, normals_inj, pipeline)
                 pose = econdata.__getitem__(case_id)
                 with seed_spans.span("pshuman: reconstruct (SMPL fit + mesh)", views="injected"):
                     carving.optimize_case(scene, pose, colors_inj, normals_inj)
@@ -942,6 +1000,7 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                 print(f"[mv-callback] scene={scene}  FAILED ({type(exc).__name__}: {exc}); carving PSHuman's own views", flush=True)
             finally:
                 pipeline.to(home)
+        _soma_views_prior(save_dir, scene, MV_VIEWS, colors, normals, pipeline)
         pose = econdata.__getitem__(case_id)
         with seed_spans.span("pshuman: reconstruct (SMPL fit + mesh)"):
             carving.optimize_case(scene, pose, colors, normals)
@@ -1005,7 +1064,9 @@ def main(
     )
     dataset_param = {'image_dir': validation_dataset.root_dir, 'seg_dir': None, 'colab': False, 'has_det': True, 'hps_type': 'pixie'}
     with seed_spans.span("pshuman: load SMPL data + reconstructor"):
-        econdata = SMPLDataset(dataset_param, device='cuda')
+        # PSHUMAN_BODY_MODEL=soma: the body is seed's fitted SOMA prior, so no HPS (PIXIE, SMPL-X) runs and no SMPL-X
+        # model is loaded; the reconstructor reads only the prior's faces and, per case, no HPS pose
+        econdata = SomaCases() if _soma_body() else SMPLDataset(dataset_param, device='cuda')
         carving = ReMesh(cfg.recon_opt, econ_dataset=econdata)
     run_inference(validation_dataloader, econdata, pipeline, carving, cfg, cfg.save_dir)
    
