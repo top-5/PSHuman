@@ -1,3 +1,5 @@
+import no_smplx  # first: SEED_NO_SMPLX=1 (a seed SOMA run) refuses SMPL-X in this process
+no_smplx.install()
 from core.remesh import calc_vertex_normals
 from core.opt import MeshOptimizer
 from utils.func import  make_sparse_camera,  make_round_views
