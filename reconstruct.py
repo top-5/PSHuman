@@ -2418,6 +2418,16 @@ class ReMesh:
                     flush=True,
                 )
 
+        # PSHUMAN_DEBUG_DUMP_MESH_AT="0,5,20,...": the carve mesh at those iterations, {case_path}/remesh_steps/ (diagnostic)
+        _dump_at = {int(x) for x in os.environ.get("PSHUMAN_DEBUG_DUMP_MESH_AT", "").split(",") if x.strip().isdigit()}
+
+        def _dump_mesh(step):
+            if step in _dump_at:
+                os.makedirs(f"{case_path}/remesh_steps", exist_ok=True)
+                trimesh.Trimesh(vertices=vertices.detach().cpu().numpy(), faces=faces.detach().cpu().numpy(),
+                                process=False).export(f"{case_path}/remesh_steps/{step:04d}.ply")
+
+        _dump_mesh(0)
         # ###----------------------- optimization iterations-------------------------------------
         for i in tqdm(range(self.opt.iters)):
             nrm_opt.zero_grad()
@@ -2466,6 +2476,7 @@ class ReMesh:
             nrm_opt.step()
             
             vertices,faces = nrm_opt.remesh()
+            _dump_mesh(i + 1)
 
             # Per-iter rendered-normal dump (opt-in via PSHUMAN_DEBUG_DUMP_NORMALS=1).
             # Writes {case_path}/normals/{step:04d}.png so we can watch pancake

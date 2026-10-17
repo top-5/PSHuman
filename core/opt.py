@@ -1,3 +1,4 @@
+import os
 from copy import deepcopy
 import time
 import torch
@@ -48,6 +49,44 @@ def remesh(
 
     return remove_dummies(vertices_etc,faces)
     
+#: untangle_folds: relaxation rounds per remesh step
+UNTANGLE_ROUNDS = 10
+
+
+@torch.no_grad()
+def untangle_folds(vertices: torch.Tensor, faces: torch.Tensor, rounds: int = UNTANGLE_ROUNDS) -> dict:
+    """In place: no face left inside out after a remesh step (PSHUMAN_REMESH_UNTANGLE=1). A face is inverted when its
+    normal points against its corners' area-weighted vertex normals summed (a smooth one-ring reference); each round sets
+    the corners of the inverted faces, and their neighbours, to their neighbour average.
+
+    WHY. megan-fox's SOMA carve (2026-10-16) left 57-98 inverted face triangles from smooth, fold-free starts; per-step
+    dumps showed them forming throughout the run (13 at step 64, 49 at 256, 63 at 500), during the split/collapse/flip
+    operations, and Poisson turned them into pits up to 1.2 cm deep that the texture paints dark."""
+    edges, _ = calc_edges(faces)
+    n = vertices.shape[0]
+    first = None
+    k = 0
+    for k in range(rounds + 1):
+        fn = calc_face_normals(vertices, faces, normalize=False)
+        vn = calc_vertex_normals(vertices, faces, fn)
+        bad = (fn * vn[faces].sum(dim=1)).sum(dim=-1) < 0
+        if first is None:
+            first = int(bad.sum())
+        if not bool(bad.any()) or k == rounds:
+            break
+        sel = torch.zeros(n, dtype=torch.bool, device=vertices.device)
+        sel[faces[bad].reshape(-1)] = True
+        grow = torch.zeros(n, dtype=torch.bool, device=vertices.device)
+        grow[edges[sel[edges[:, 0]], 1]] = True
+        grow[edges[sel[edges[:, 1]], 0]] = True
+        sel |= grow
+        nbr = torch.zeros_like(vertices)
+        nbr = _deterministic_scatter_mean(src=vertices[edges.flip(dims=[1]).reshape(-1)], index=edges.reshape(-1, 1),
+                                    dim=0, out=nbr)
+        vertices[sel] = nbr[sel]
+    return {"inverted_before": first, "inverted_after": int(bad.sum()), "rounds": k}
+
+
 def lerp_unbiased(a:torch.Tensor,b:torch.Tensor,weight:float,step:int):
     """lerp with adam's bias correction"""
     c_prev = 1-weight**(step-1)
@@ -103,6 +142,16 @@ class MeshOptimizer:
         self.vertices.copy_(vertices) #initialize vertices
         self._vertices.requires_grad_()
         self._ref_len.fill_(edge_len_lims[1])
+        # PSHUMAN_REMESH_LOCAL_REFLEN=1: each vertex's reference edge length starts at its own mean edge length (clamped
+        # to edge_len_lims), not the largest allowed. The step is velocity * ref_len: from 0.1 (4.4 cm on a 170 cm body)
+        # the first step moved SOMA's face vertices ~0.26 cm across 0.1-0.36 cm triangles and folded 178 face triangles
+        # at iteration 1 (megan-fox 2026-10-16); the folds survived the remesh as pits up to 1.2 cm deep.
+        if os.environ.get("PSHUMAN_REMESH_LOCAL_REFLEN", "0").strip().lower() in {"1", "true", "yes", "on"}:
+            edges, _ = calc_edges(faces)
+            length = (vertices[edges[:, 0]] - vertices[edges[:, 1]]).norm(dim=-1)
+            total = torch.zeros(vertices.shape[0], device=vertices.device).index_add_(0, edges[:, 0], length).index_add_(0, edges[:, 1], length)
+            count = torch.zeros(vertices.shape[0], device=vertices.device).index_add_(0, edges[:, 0], torch.ones_like(length)).index_add_(0, edges[:, 1], torch.ones_like(length))
+            self._ref_len.copy_((total / count.clamp_min(1)).clamp(*edge_len_lims))
 
     @property
     def vertices(self):
@@ -192,6 +241,8 @@ class MeshOptimizer:
         self._vertices_etc,self._faces = remesh(self._vertices_etc,self._faces,min_edge_len,max_edge_len,flip)
 
         self._split_vertices_etc()
+        if os.environ.get("PSHUMAN_REMESH_UNTANGLE", "0").strip().lower() in {"1", "true", "yes", "on"}:
+            self.untangle_report = untangle_folds(self._vertices, self._faces)
         self._vertices.requires_grad_()
 
         return self._vertices, self._faces
