@@ -125,6 +125,11 @@ def _load_soma_body_prior_npz(path, device):
         "vertices": torch.as_tensor(verts, device=device),
         "faces": torch.as_tensor(faces.astype(np.int64), device=device),
     }
+    # optional: the surface the carve starts from, when seed gives one (a closed, evenly meshed shell of the same
+    # body: SOMA's own face has parted lips over an inner mouth, and the carve grew needles from it)
+    if "carve_vertices" in data and "carve_faces" in data:
+        out["carve_vertices"] = torch.as_tensor(np.asarray(data["carve_vertices"], dtype=np.float32), device=device)
+        out["carve_faces"] = torch.as_tensor(np.asarray(data["carve_faces"]).astype(np.int64), device=device)
     for key in SOMA_PRIOR_GROUPS:
         ids = np.asarray(data[key]).reshape(-1)
         if ids.size == 0 or not np.issubdtype(ids.dtype, np.integer) or ids.min() < 0 or ids.max() >= n:
@@ -2301,7 +2306,11 @@ class ReMesh:
             masks = masks_original
             target_normals = target_normals_original
 
-        carve_v, carve_f, _ = _outer_surface(v_smpl.detach(), body_face.detach())
+        if body_prior is not None and "carve_vertices" in body_prior:
+            carve_v, carve_f, _ = _outer_surface(body_prior["carve_vertices"], body_prior["carve_faces"])
+            print(f"[carve] start: seed's carve surface from the SOMA prior ({int(carve_v.shape[0])} vertices)", flush=True)
+        else:
+            carve_v, carve_f, _ = _outer_surface(v_smpl.detach(), body_face.detach())
         print(f"[carve] start: the {'SOMA' if body_model == 'soma' else 'SMPL-X'} outer surface, {int(carve_v.shape[0])} of {int(v_smpl.shape[0])} vertices "
               "(eyeballs dropped)", flush=True)
         nrm_opt = MeshOptimizer(carve_v, carve_f, edge_len_lims=[0.01, 0.1])

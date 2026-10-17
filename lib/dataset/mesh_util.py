@@ -2034,9 +2034,45 @@ def _poisson_points(points, normals, depth):
     return trimesh.Trimesh(np.array(out.vertices), np.array(out.triangles), process=False)
 
 
+def _fold_safe_normals(mesh):
+    """`mesh` with the vertex normals of its folds replaced by their neighbourhood's (seed, 2026-10-16).
+
+    Poisson trusts every point's normal. A carve that folds (inside-out faces under the lips and chin: ~100 there when
+    carving from a SOMA start, 7-9 from SMPL-X's, megan-fox) hands it inward normals there, and it grows a dark ring
+    and long vertical needles from them that change run to run. A face is a fold when its normal opposes the two-ring
+    smoothed normal around it; every vertex of a fold takes that smoothed normal. Geometry is untouched. Returns the
+    number of fold faces. PSHUMAN_POISSON_FOLD_NORMALS=0 turns it off."""
+    import scipy.sparse as sp
+
+    V = np.asarray(mesh.vertices, dtype=np.float64)
+    F = np.asarray(mesh.faces, dtype=np.int64)
+    if len(F) == 0:
+        return 0
+    fn = np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]])
+    vn = np.zeros_like(V)
+    for k in range(3):
+        np.add.at(vn, F[:, k], fn)
+    e = np.r_[F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]
+    A = sp.coo_matrix((np.ones(2 * len(e)), (np.r_[e[:, 0], e[:, 1]], np.r_[e[:, 1], e[:, 0]])), shape=(len(V), len(V)))
+    A = (A > 0).astype(np.float64).tocsr()
+    M = sp.diags(1.0 / np.maximum(np.asarray(A.sum(1)).ravel(), 1.0)) @ A
+    ring = M @ (M @ vn)
+    fold = np.einsum("ij,ij->i", fn, ring[F].sum(axis=1)) < 0
+    if fold.any():
+        normals = np.asarray(mesh.vertex_normals, dtype=np.float64).copy()
+        ids = np.unique(F[fold])
+        smooth = ring[ids] / np.maximum(np.linalg.norm(ring[ids], axis=1, keepdims=True), 1e-12)
+        normals[ids] = smooth
+        mesh.vertex_normals = normals
+    return int(fold.sum())
+
+
 def poisson(mesh, obj_path, depth=10, decimation=True, front_mask=None, ortho_scale=None, report_path=None):
 
     assert (mesh.vertex_normals.shape[1] == 3)
+    if os.environ.get("PSHUMAN_POISSON_FOLD_NORMALS", "1").strip().lower() not in {"0", "false", "no", "off"}:
+        folds = _fold_safe_normals(mesh)
+        print(f"[poisson] fold-safe normals: {folds} fold faces had their vertices' normals smoothed", flush=True)
     arm_joins = None
     if front_mask is not None and ortho_scale is not None and os.environ.get(
         "PSHUMAN_ARM_FRONTAL_REBUILD", "1"
@@ -2069,7 +2105,12 @@ def poisson(mesh, obj_path, depth=10, decimation=True, front_mask=None, ortho_sc
     # Preserve largest-component behavior for production output.
     if os.environ.get("PSHUMAN_POISSON_MERGE_COMPONENTS", "0").strip().lower() in {"1", "true", "yes", "on"}:
         print("[poisson-merge] requested but permanently disabled because it creates bridge artifacts")
-    if os.environ.get("PSHUMAN_POISSON_ATTRACT_PARTS", "1").strip().lower() not in {"0", "false", "no", "off"}:
+    # The fallback for callers WITHOUT a front mask only (its own docstring). After the front-mask arm rebuild it
+    # re-attached Poisson's small debris pieces (folds under the lips: 71 components on megan-fox's SOMA carve) by
+    # sliding them in depth onto the body and fusing them: the long vertical needles under the chin (seed, 2026-10-16;
+    # carve 0 vertices > 1 cm off, Poisson 0, after this pass 24, up to 2.3 cm). PSHUMAN_POISSON_ATTRACT_PARTS=1 forces it.
+    attract = os.environ.get("PSHUMAN_POISSON_ATTRACT_PARTS", "auto").strip().lower()
+    if attract in {"1", "true", "yes", "on"} or (attract == "auto" and arm_joins is None):
         raw_mesh = attract_parts_to_body_plane(raw_mesh, depth=depth)
     # After an arm re-attachment, an arm piece Poisson still left separate is KEPT (adjacent and
     # body-part sized), never dropped; the donor graft replaces the arm anyway.
