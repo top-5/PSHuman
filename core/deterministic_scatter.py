@@ -37,6 +37,13 @@ def _segment_sum_and_count(values: torch.Tensor, index: torch.Tensor, dim_size: 
     """Deterministic per-index sum and count of a 1-D `values`/`index` pair, via sort + cumsum."""
     order = torch.argsort(index, stable=True)
     sorted_values = values[order]
+    # Subtracting global float32 prefix sums loses the small local coordinate
+    # differences the mesh optimizer needs. At 100k groups even a constant
+    # 1.001 field became 1.0..1.0078125. Accumulate AND subtract in float64;
+    # scatter_mean casts only after dividing, when copying to the caller's out.
+    # This preserves deterministic ordering without CUDA atomics.
+    if sorted_values.dtype in (torch.float16, torch.bfloat16, torch.float32):
+        sorted_values = sorted_values.to(torch.float64)
     cumsum = torch.cat([sorted_values.new_zeros(1), torch.cumsum(sorted_values, dim=0)])
     counts = torch.bincount(index, minlength=dim_size)
     offsets = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
