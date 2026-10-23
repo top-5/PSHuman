@@ -12,6 +12,30 @@ DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_large_constant_coordinate_field_is_preserved(device: str) -> None:
+    """A mesh Laplacian must not invent movement in a constant coordinate."""
+    groups = 100000
+    src = torch.full((groups * 4, 1), 1.001, device=device)
+    index = torch.arange(groups, device=device).repeat_interleave(4)[:, None]
+    out = torch.zeros((groups, 1), device=device)
+    det.scatter_mean(src=src, index=index, dim=0, out=out)
+    assert torch.equal(out, torch.full_like(out, 1.001))
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_small_neighbor_difference_survives_large_prefix(device: str) -> None:
+    """Unrelated earlier vertices must not quantize a later local mean."""
+    groups = 100000
+    local = torch.tensor([1.001, 1.002, 1.003, 1.004], device=device)
+    src = local.repeat(groups)[:, None]
+    index = torch.arange(groups, device=device).repeat_interleave(4)[:, None]
+    out = torch.zeros((groups, 1), device=device)
+    det.scatter_mean(src=src, index=index, dim=0, out=out)
+    expected = local.double().mean().float()
+    assert torch.equal(out, expected.expand_as(out))
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_scatter_mean_matches_torch_scatter_with_broadcast_index(device: str) -> None:
     # opt.py's call shape: src (E*2, S), index (E*2, 1) broadcast across S columns.
     torch.manual_seed(0)
