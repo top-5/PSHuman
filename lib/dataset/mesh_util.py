@@ -1971,6 +1971,15 @@ def rebuild_arms_from_front_mask(mesh, front_mask, ortho_scale):
         hd = np.interp(all_s, dist, hd[dist])
 
         start = max(0, defect - ARM_RING_OVERLAP_STATIONS)
+        # A proximal station with no surface group keeps c/h NaN; the 5-tap smoothing below spreads it and the join
+        # points carry it into Poisson ("bad data") and heal_joins' KD-tree (syn-jasper 2026-10-24: "data must be
+        # finite"). Fill those gaps from the stations either side before the profile is built.
+        near = np.flatnonzero(np.isfinite(c[:defect]))
+        if near.size and near.size < defect:
+            c[:defect] = np.interp(np.arange(defect), near, c[near])
+        near = np.flatnonzero(np.isfinite(h[:defect]))
+        if near.size and near.size < defect:
+            h[:defect] = np.interp(np.arange(defect), near, h[near])
         cc = np.where(all_s < defect, c, cd)
         hh = np.where(all_s < defect, h, np.maximum(hd, k_ref * st[:, 2]))
         span = all_s >= start
