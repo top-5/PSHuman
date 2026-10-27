@@ -13,7 +13,7 @@ from pathlib import Path
 import time
 
 
-def run(config_path, requests_path):
+def run(config_path, requests_path, checkpoint):
     if os.environ.get('PSHUMAN_RESIDENT_PIPELINE') != '1':
         raise ValueError('Explicit PSHUMAN_RESIDENT_PIPELINE=1 required')
     import inference
@@ -25,6 +25,9 @@ def run(config_path, requests_path):
     root = requests_path.parent
     requests = json.loads(requests_path.read_text())
     base = OmegaConf.merge(OmegaConf.structured(inference.TestConfig), load_config(config_path))
+    # Same explicit override as scripts/run_pshuman.sh; the upstream YAML's
+    # backbone name alone is not the trained PSHuman multi-view checkpoint.
+    base.pretrained_model_name_or_path = checkpoint
     results = []
     for request in requests:
         output = (root / request['output']).resolve()
@@ -64,5 +67,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', required=True)
     parser.add_argument('--requests', required=True)
+    parser.add_argument('--checkpoint', required=True)
     args = parser.parse_args()
-    run(args.config, args.requests)
+    run(args.config, args.requests, args.checkpoint)
