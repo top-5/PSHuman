@@ -32,6 +32,11 @@ def run(config_path, requests_path, checkpoint):
     base.pretrained_model_name_or_path = checkpoint
     results = []
     for request in requests:
+        policy = request.get('environment', {})
+        required = ('PSHUMAN_REMESH_LOCAL_REFLEN', 'PSHUMAN_REMESH_UNTANGLE', 'PSHUMAN_VIEW_WEIGHTS')
+        if any(k not in policy for k in required) or any(not k.startswith('PSHUMAN_') for k in policy):
+            raise ValueError('Explicit standard-adapter reconstruction policy required')
+        os.environ.update({k: str(v) for k, v in policy.items()})
         output = (root / request['output']).resolve()
         if not output.is_relative_to(root) or output == root or output.exists():
             raise ValueError('New contained request output required')
@@ -64,6 +69,7 @@ def run(config_path, requests_path, checkpoint):
             name = span['name']
             totals[name] = totals.get(name, 0) + (span['end_unix_nano'] - span['start_unix_nano']) / 1e9
         row = dict(output=str(output), status=status, error=error, seconds=time.perf_counter()-start,
+                   reconstruction_policy=policy,
                    phases_inclusive=totals, prior_sha256=hashlib.sha256(Path(os.environ['PSHUMAN_BODY_PRIOR_NPZ']).read_bytes()).hexdigest())
         (output / 'resident-request.json').write_text(json.dumps(row, indent=2)+'\n')
         results.append(row)

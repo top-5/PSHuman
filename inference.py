@@ -1030,6 +1030,8 @@ def load_pshuman_pipeline(cfg):
     global _resident_pipeline, _resident_pipeline_key, _resident_rng
     resident = os.environ.get('PSHUMAN_RESIDENT_PIPELINE') == '1'
     if resident:
+        if cfg.seed is None:
+            raise ValueError('Resident parity mode requires an explicit fixed seed')
         from huggingface_hub import snapshot_download
         # Immutable cached Hub snapshot; refuse a mutable local directory cache.
         if os.path.isdir(cfg.pretrained_model_name_or_path):

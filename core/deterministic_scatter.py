@@ -96,17 +96,11 @@ def scatter_mean(src: torch.Tensor, index: torch.Tensor, dim: int, out: torch.Te
     return out
 
 
-def scatter_max(src: torch.Tensor, index: torch.Tensor, dim: int, out: torch.Tensor) -> torch.Tensor:
+def _reference_scatter_max(src: torch.Tensor, index: torch.Tensor, dim: int, out: torch.Tensor) -> torch.Tensor:
     """Deterministic replacement for `torch_scatter.scatter_max(src, index, dim, out)`."""
     if dim != 0:
         raise NotImplementedError("only dim=0 is used by opt.py/remesh.py")
     index = _broadcast_index(index, src)
-    # Integer remesh ranks admit an exact associative native CUDA max. Floating
-    # data retain the existing sorted reference, including its corner semantics.
-    if (os.environ.get('PSHUMAN_FAST_MESH') == '1' and src.is_cuda
-            and src.dtype in (torch.int32, torch.int64)):
-        from seed.mesh_ops.gpu_reductions import integer_scatter_max
-        return integer_scatter_max(src, index, out)
     dim_size = out.shape[0]
     flat_src, flat_index = src.reshape(src.shape[0], -1), index.reshape(index.shape[0], -1)
     flat_out = out.reshape(out.shape[0], -1)
@@ -117,3 +111,36 @@ def scatter_max(src: torch.Tensor, index: torch.Tensor, dim: int, out: torch.Ten
     result = torch.stack(columns, dim=1).reshape(out.shape)
     out.copy_(result)
     return out
+
+
+_verified_calls = 0
+
+def scatter_max(src, index, dim, out):
+    global _verified_calls
+    if dim != 0:
+        raise NotImplementedError("only dim=0 is used")
+    index = _broadcast_index(index, src)
+    if (os.environ.get('PSHUMAN_FAST_MESH') == '1' and src.is_cuda
+            and src.dtype in (torch.int32, torch.int64)):
+        from seed.mesh_ops.gpu_reductions import integer_scatter_max
+        verify = os.environ.get('PSHUMAN_FAST_VERIFY') == '1'
+        reference = _reference_scatter_max(src, index, dim, out.clone()) if verify else None
+        result = integer_scatter_max(src, index, out)
+        if verify:
+            if not torch.equal(reference, result):
+                raise RuntimeError('Integer rank max failed exact same-input parity')
+            _verified_calls += 1
+        return result
+    return _reference_scatter_max(src, index, dim, out)
+
+
+def _write_verification():
+    path = os.environ.get('PSHUMAN_FAST_VERIFY_RECEIPT')
+    if path:
+        import json
+        from pathlib import Path
+        Path(path).write_text(json.dumps(dict(exact_checked_calls=_verified_calls,
+            scope='integer rank arrays on identical live inputs; not full mesh parity'), indent=2)+'\n')
+
+import atexit
+atexit.register(_write_verification)
