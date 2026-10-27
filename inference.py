@@ -1019,8 +1019,28 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                
      
 
+_resident_pipeline = None
+_resident_pipeline_key = None
+_resident_imports_reported = False
+
+
 @seed_spans.profile_stage('diffusion model loading')
 def load_pshuman_pipeline(cfg):
+    global _resident_pipeline, _resident_pipeline_key
+    resident = os.environ.get('PSHUMAN_RESIDENT_PIPELINE') == '1'
+    if resident:
+        from huggingface_hub import snapshot_download
+        # Immutable cached Hub snapshot; refuse a mutable local directory cache.
+        if os.path.isdir(cfg.pretrained_model_name_or_path):
+            raise ValueError('Resident mode requires an immutable Hub snapshot identity')
+        snapshot = snapshot_download(cfg.pretrained_model_name_or_path, local_files_only=True)
+        key = (os.path.realpath(snapshot), str(weight_dtype), str(getattr(cfg, 'scheduler', None)))
+        if _resident_pipeline is not None:
+            if key != _resident_pipeline_key:
+                raise ValueError('Resident model configuration changed: start a new worker')
+            _resident_pipeline.to('cuda')
+            seed_spans.emit('pshuman: resident pipeline cache hit', time.time_ns(), time.time_ns())
+            return _resident_pipeline
     unet = UNetMV2DConditionModel.from_pretrained(
         cfg.pretrained_model_name_or_path,
         subfolder="unet",
@@ -1048,16 +1068,21 @@ def load_pshuman_pipeline(cfg):
         print(f"[seed] multiview diffusion scheduler: {type(pipeline.scheduler).__name__}", flush=True)
     if torch.cuda.is_available():
         pipeline.to('cuda')
+    if resident:
+        _resident_pipeline, _resident_pipeline_key = pipeline, key
     return pipeline
 
 def main(
     cfg: TestConfig
 ):
+    global _resident_imports_reported
 
     # If passed along, set the training seed now.
     if cfg.seed is not None:
         set_seed(cfg.seed)
-    seed_spans.emit("pshuman: python start + imports", seed_spans.PROCESS_T0_NS, time.time_ns())
+    if not _resident_imports_reported:
+        seed_spans.emit("pshuman: python start + imports", seed_spans.PROCESS_T0_NS, time.time_ns())
+        _resident_imports_reported = True
     injection_only = os.environ.get("PSHUMAN_INJECTION_ONLY") == "1"
     if injection_only and not cfg.mv_inject_dir:
         raise ValueError("PSHUMAN_INJECTION_ONLY requires mv_inject_dir")
