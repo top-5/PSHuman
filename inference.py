@@ -1021,12 +1021,13 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
 
 _resident_pipeline = None
 _resident_pipeline_key = None
+_resident_rng = None
 _resident_imports_reported = False
 
 
 @seed_spans.profile_stage('diffusion model loading')
 def load_pshuman_pipeline(cfg):
-    global _resident_pipeline, _resident_pipeline_key
+    global _resident_pipeline, _resident_pipeline_key, _resident_rng
     resident = os.environ.get('PSHUMAN_RESIDENT_PIPELINE') == '1'
     if resident:
         from huggingface_hub import snapshot_download
@@ -1034,11 +1035,19 @@ def load_pshuman_pipeline(cfg):
         if os.path.isdir(cfg.pretrained_model_name_or_path):
             raise ValueError('Resident mode requires an immutable Hub snapshot identity')
         snapshot = snapshot_download(cfg.pretrained_model_name_or_path, local_files_only=True)
-        key = (os.path.realpath(snapshot), str(weight_dtype), str(getattr(cfg, 'scheduler', None)))
+        key = (os.path.realpath(snapshot), str(weight_dtype), str(getattr(cfg, 'scheduler', None)), cfg.seed)
         if _resident_pipeline is not None:
             if key != _resident_pipeline_key:
                 raise ValueError('Resident model configuration changed: start a new worker')
             _resident_pipeline.to('cuda')
+            # main resets the seed before model load. Reusing weights must not
+            # skip the RNG consumption of cold model construction: remeshing
+            # uses the global generator too, independently of diffusion's RNG.
+            import random
+            torch.set_rng_state(_resident_rng[0])
+            torch.cuda.set_rng_state_all(_resident_rng[1])
+            np.random.set_state(_resident_rng[2])
+            random.setstate(_resident_rng[3])
             seed_spans.emit('pshuman: resident pipeline cache hit', time.time_ns(), time.time_ns())
             return _resident_pipeline
     unet = UNetMV2DConditionModel.from_pretrained(
@@ -1069,7 +1078,9 @@ def load_pshuman_pipeline(cfg):
     if torch.cuda.is_available():
         pipeline.to('cuda')
     if resident:
+        import random
         _resident_pipeline, _resident_pipeline_key = pipeline, key
+        _resident_rng = (torch.get_rng_state(), torch.cuda.get_rng_state_all(), np.random.get_state(), random.getstate())
     return pipeline
 
 def main(

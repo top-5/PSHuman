@@ -11,6 +11,8 @@ import json
 import os
 from pathlib import Path
 import time
+import gc
+import traceback
 
 
 def run(config_path, requests_path, checkpoint):
@@ -49,6 +51,14 @@ def run(config_path, requests_path, checkpoint):
                 inference.main(cfg)
         except Exception as exc:
             status, error = 'failed', repr(exc)
+            traceback.print_exc()
+        finally:
+            # Keep decoded weights resident in host RAM, not stale renderer
+            # tensors/caches on a shared 24GB GPU between requests.
+            if inference._resident_pipeline is not None:
+                inference._resident_pipeline.to('cpu')
+            gc.collect()
+            inference.torch.cuda.empty_cache()
         totals = {}
         for span in load(output / 'spans.jsonl'):
             name = span['name']
