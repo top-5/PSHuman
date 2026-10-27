@@ -779,9 +779,10 @@ def _soma_views_prior(save_dir: str, scene: str, view_names: List[str], colors, 
 
 
 def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  save_dir):
-    pipeline.set_progress_bar_config(disable=True)
+    if pipeline is not None:
+        pipeline.set_progress_bar_config(disable=True)
 
-    if cfg.seed is None:
+    if cfg.seed is None or pipeline is None:
         generator = None
     else:
         generator = torch.Generator(device=pipeline.unet.device).manual_seed(cfg.seed)
@@ -789,7 +790,7 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
     # View ordering used by ReMesh.load_training_data — keep in sync.
     MV_VIEWS = ['front_face', 'front_right', 'right', 'back', 'left', 'front_left']
 
-    prompt_overrides = build_prompt_embeddings(pipeline, cfg.num_views, cfg)
+    prompt_overrides = build_prompt_embeddings(pipeline, cfg.num_views, cfg) if pipeline is not None else None
     images_cond, pred_cat = [], defaultdict(list)
     for case_id, batch in tqdm(enumerate(dataloader)):
         images_cond.append(batch['imgs_in'][:, 0])
@@ -799,10 +800,15 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
         inject_loaded = None
         if cfg.mv_inject_dir:
             inject_dir = os.path.join(cfg.mv_inject_dir, scene)
+            if pipeline is None:
+                from seed.pipeline.pshuman_bundle import validate_injection_bundle
+                validate_injection_bundle(Path(inject_dir))
             inject_loaded = _try_load_injected_mv(inject_dir, MV_VIEWS, cfg.validation_dataset.crop_size)
             if inject_loaded is not None:
                 colors_inj, normals_inj = inject_loaded
                 print(f"[mv-inject] scene={scene}  loaded 6+6 RGBA from {inject_dir}")
+                if cfg.mv_dump_dir:
+                    _dump_mv_layers(cfg.mv_dump_dir, scene, MV_VIEWS, colors_inj, normals_inj, batch['imgs_in'][0, 0])
                 _soma_views_prior(save_dir, scene, MV_VIEWS, colors_inj, normals_inj, pipeline)
                 pose = econdata.__getitem__(case_id)
                 with seed_spans.span("pshuman: reconstruct (SMPL fit + mesh)", views="injected"):
@@ -810,7 +816,12 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                 torch.cuda.empty_cache()
                 continue
             else:
+                if pipeline is None:
+                    raise RuntimeError(f"strict injection has no usable views: {inject_dir}")
                 print(f"[mv-inject] scene={scene}  NO usable images at {inject_dir} — running diffusion as fallback")
+
+        if pipeline is None:
+            raise RuntimeError("strict injection requires MV_INJECT_DIR; diffusion fallback is disabled")
 
         imgs_in = torch.cat([batch['imgs_in']]*2, dim=0)
         num_views = imgs_in.shape[1]
@@ -1046,8 +1057,15 @@ def main(
     if cfg.seed is not None:
         set_seed(cfg.seed)
     seed_spans.emit("pshuman: python start + imports", seed_spans.PROCESS_T0_NS, time.time_ns())
-    with seed_spans.span("pshuman: load diffusion pipeline"):
-        pipeline = load_pshuman_pipeline(cfg)
+    injection_only = os.environ.get("PSHUMAN_INJECTION_ONLY") == "1"
+    if injection_only and not cfg.mv_inject_dir:
+        raise ValueError("PSHUMAN_INJECTION_ONLY requires mv_inject_dir")
+    if injection_only:
+        pipeline = None
+        print("[mv-inject] strict injection-only: diffusion weights are not loaded", flush=True)
+    else:
+        with seed_spans.span("pshuman: load diffusion pipeline"):
+            pipeline = load_pshuman_pipeline(cfg)
     
 
     if cfg.with_smpl:
