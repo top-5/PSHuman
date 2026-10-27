@@ -1019,6 +1019,7 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                
      
 
+@seed_spans.profile_stage('diffusion model loading')
 def load_pshuman_pipeline(cfg):
     unet = UNetMV2DConditionModel.from_pretrained(
         cfg.pretrained_model_name_or_path,

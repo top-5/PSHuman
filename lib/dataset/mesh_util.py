@@ -1,3 +1,4 @@
+import seed_spans
 # -*- coding: utf-8 -*-
 
 # Max-Planck-Gesellschaft zur Förderung der Wissenschaften e.V. (MPG) is
@@ -1497,6 +1498,7 @@ HEAL_TAUBIN_MU = -0.53
 HEAL_TAUBIN_ITERATIONS = 10
 
 
+@seed_spans.profile_stage('Poisson join healing')
 def heal_joins(mesh, contact_points, radius_fraction=HEAL_JOIN_RADIUS_FRACTION):
     """Restore a natural surface across the welds where displaced parts were re-fused.
 
@@ -1814,6 +1816,7 @@ def _flatten_depth_drift(verts, verts_out, bi, b_idx, st, height):
     return {"drift": drift, "moved": int(moved.sum()), "line": line}
 
 
+@seed_spans.profile_stage('arm depth profile rebuild')
 def rebuild_arms_from_front_mask(mesh, front_mask, ortho_scale):
     """Re-attach every arm piece at the depth the FRONT VIEW implies, and rebuild the tissue between.
 
@@ -2034,6 +2037,7 @@ def rebuild_arms_from_front_mask(mesh, front_mask, ortho_scale):
     return points, normals, report
 
 
+@seed_spans.profile_stage('screened Poisson solve')
 def _poisson_points(points, normals, depth):
     pcl = o3d.geometry.PointCloud()
     pcl.points = o3d.utility.Vector3dVector(np.ascontiguousarray(points, dtype=np.float64))
@@ -2043,6 +2047,7 @@ def _poisson_points(points, normals, depth):
     return trimesh.Trimesh(np.array(out.vertices), np.array(out.triangles), process=False)
 
 
+@seed_spans.profile_stage('fold-safe normals')
 def _fold_safe_normals(mesh):
     """`mesh` with the vertex normals of its folds replaced by their neighbourhood's (seed, 2026-10-16).
 
@@ -2076,6 +2081,7 @@ def _fold_safe_normals(mesh):
     return int(fold.sum())
 
 
+@seed_spans.profile_stage('fusion Poisson inclusive')
 def poisson(mesh, obj_path, depth=10, decimation=True, front_mask=None, ortho_scale=None, report_path=None):
 
     assert (mesh.vertex_normals.shape[1] == 3)

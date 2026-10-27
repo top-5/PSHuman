@@ -1,3 +1,4 @@
+import seed_spans
 from typing import List
 import os
 import torch
@@ -368,6 +369,7 @@ def complete_unseen_vertex_color(meshes: Meshes, valid_index: torch.Tensor) -> d
     meshes.textures = TexturesVertex(verts_features=[colors])
     return meshes
 
+@seed_spans.profile_stage('multiview colour projection')
 def multiview_color_projection(
     meshes: Meshes,
     image_list: torch.Tensor,

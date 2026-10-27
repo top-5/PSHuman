@@ -1,3 +1,4 @@
+import seed_spans
 import os
 from copy import deepcopy
 import time
@@ -175,6 +176,7 @@ class MeshOptimizer:
         self._vertices.grad = None
 
     @torch.no_grad()
+    @seed_spans.profile_stage('mesh optimizer step')
     def step(self):
         
         eps = 1e-8
@@ -234,6 +236,7 @@ class MeshOptimizer:
             self._ref_len *= len_change
             self._ref_len.clamp_(*self._edge_len_lims)
             
+    @seed_spans.profile_stage('remeshing')
     def remesh(self, flip:bool=True)->tuple[torch.Tensor,torch.Tensor]:
         min_edge_len = self._ref_len * (1 - self._edge_len_tol)
         max_edge_len = self._ref_len * (1 + self._edge_len_tol)

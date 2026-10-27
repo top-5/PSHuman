@@ -9,6 +9,7 @@ import os
 import secrets
 import socket
 import time
+import functools
 
 #: when this module was first imported: the process start, near enough (it is imported at the top of inference.py)
 PROCESS_T0_NS = time.time_ns()
@@ -40,3 +41,35 @@ def span(name, **attributes):
         yield
     finally:
         emit(name, t0, time.time_ns(), **attributes)
+
+
+def profile_stage(name):
+    """Opt-in synchronized stage wall time and process CUDA-memory counters.
+
+    Disabled by default. Peak counters are process-lifetime peaks, not exclusive
+    stage allocations; no nested reset can erase a parent's memory record.
+    """
+    def decorate(function):
+        @functools.wraps(function)
+        def wrapped(*args, **kwargs):
+            if os.environ.get('PSHUMAN_PROFILE_STAGES') != '1':
+                return function(*args, **kwargs)
+            import torch
+            cuda = torch.cuda.is_initialized()
+            if cuda:
+                torch.cuda.synchronize()
+            start = time.time_ns()
+            before = torch.cuda.memory_allocated() if cuda else 0
+            try:
+                return function(*args, **kwargs)
+            finally:
+                if torch.cuda.is_initialized():
+                    torch.cuda.synchronize()
+                    memory = dict(cuda_allocated_start=before, cuda_allocated_end=torch.cuda.memory_allocated(),
+                                  cuda_process_peak_allocated=torch.cuda.max_memory_allocated(),
+                                  cuda_reserved_end=torch.cuda.memory_reserved())
+                else:
+                    memory = {}
+                emit('pshuman profile: ' + name, start, time.time_ns(), cuda_synchronized=True, **memory)
+        return wrapped
+    return decorate

@@ -1,3 +1,4 @@
+import seed_spans
 import no_smplx  # first: SEED_NO_SMPLX=1 (a seed SOMA run) refuses SMPL-X in this process
 no_smplx.install()
 from core.remesh import calc_vertex_normals
@@ -1088,6 +1089,7 @@ class ReMesh:
         renderer = NormalsRenderer(mv, proj, [self.resolution, self.resolution], device=self.device)
         return renderer
     
+    @seed_spans.profile_stage('texture projection')
     def proj_texture(self, fused_images, vertices, faces, normal_images=None):
         mesh = to_py3d_mesh(vertices, faces)
         mesh = mesh.to(self.device)
@@ -1225,6 +1227,7 @@ class ReMesh:
         target_colors = torch.from_numpy(colors).to(self.device)
         return masks, target_colors, target_normals
     
+    @seed_spans.profile_stage('normal and colour preparation')
     def preprocess(self, color_pils, normal_pils):
           ###------------------ load target images -------------------------------
         kernal = torch.ones(3, 3)
