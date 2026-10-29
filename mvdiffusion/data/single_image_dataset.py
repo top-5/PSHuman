@@ -132,7 +132,10 @@ class SingleImageDataset(Dataset):
                         back_image = image
                 self.all_back_images.append(back_image)
                 
-                face, _ = self.load_face(os.path.join(self.root_dir, file), bg_color, return_type='pt')
+                # Optional independent face evidence; the six body inputs still use
+                # the unchanged full-body image above. No pixels are pasted into it.
+                face_path = os.environ.get('PSHUMAN_FACE_REFERENCE') or image_path
+                face, _ = self.load_face(face_path, bg_color, return_type='pt')
                 self.all_faces.append(face)
 
         if single_image is not None:
