@@ -7,6 +7,7 @@ import PIL
 from typing import Tuple, Optional
 import random
 import os
+import hashlib
 from icecream import ic
 import cv2
 
@@ -105,6 +106,9 @@ class SingleImageDataset(Dataset):
         self.all_alphas = []
         self.all_faces = []
         self.all_back_images = []
+        self.strict_back_sha = os.environ.get('SEED_PSHUMAN_BACK_SHA256')
+        if self.strict_back_sha and (not self.back_image or single_image is not None or self.num_views != 7):
+            raise ValueError('Strict back conditioning requires an explicit back image and the six-view dataset')
     
         self.all_face_embeddings = []
         bg_color = self.get_bg_color()
@@ -125,14 +129,30 @@ class SingleImageDataset(Dataset):
 
                 back_image = image
                 back_path = self._find_back_image_path(file)
+                if self.strict_back_sha and (not back_path or not os.path.isfile(back_path)):
+                    raise ValueError('Required back conditioning image is missing')
                 if back_path is not None:
                     try:
+                        if self.strict_back_sha:
+                            with open(back_path, 'rb') as stream:
+                                digest_before = hashlib.sha256(stream.read()).hexdigest()
+                            if digest_before != self.strict_back_sha:
+                                raise ValueError('Required back conditioning image hash mismatch')
                         back_image, _ = self.load_image(back_path, bg_color, return_type='pt')
+                        if self.strict_back_sha:
+                            with open(back_path, 'rb') as stream:
+                                if hashlib.sha256(stream.read()).hexdigest() != digest_before:
+                                    raise ValueError('Required back conditioning image changed during load')
                     except Exception:
+                        if self.strict_back_sha:
+                            raise
                         back_image = image
                 self.all_back_images.append(back_image)
                 
-                face, _ = self.load_face(os.path.join(self.root_dir, file), bg_color, return_type='pt')
+                # Optional independent face evidence; the six body inputs still use
+                # the unchanged full-body image above. No pixels are pasted into it.
+                face_path = os.environ.get('PSHUMAN_FACE_REFERENCE') or image_path
+                face, _ = self.load_face(face_path, bg_color, return_type='pt')
                 self.all_faces.append(face)
 
         if single_image is not None:
@@ -331,6 +351,8 @@ class SingleImageDataset(Dataset):
             # in single_image mode; actual back photo in multi-image mode).
             # noise_level in the pipeline config smears the hair signal for side views.
             cond_views = [image, image, image, back_image, back_image, image]
+            if self.strict_back_sha:
+                print(f'[seed-back-conditioning] sha256={self.strict_back_sha}', flush=True)
             img_tensors_in = [tmp.permute(2, 0, 1) for tmp in cond_views] + [
                 self.all_faces[index%len(self.all_images)].permute(2, 0, 1)
             ]
