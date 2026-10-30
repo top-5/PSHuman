@@ -81,3 +81,11 @@ def test_reject_bad_threshold_and_nonfinite_transported_state():
 
 def test_attenuation_one_preserves_loss_and_alpha():
  v=torch.zeros((3,3));f=torch.tensor(FACES);state=torch.zeros((3,10));alpha=torch.ones((1,5,5,1));before=alpha.clone();res=normal_confidence(Renderer(),v,f,state,alpha,dilation=1,attenuation=1.0);assert torch.equal(res,torch.ones_like(res));assert torch.equal(alpha,before)
+
+def test_capture_loaded_initial_state_is_exact_and_exclusive(tmp_path):
+ from utils.arm_normal_confidence import capture_initial_state
+ path=tmp_path/'state.npz';tensor=torch.arange(12,dtype=torch.float32).reshape(3,4)[:,::2]
+ receipt=capture_initial_state(path,normal_target=tensor)
+ with np.load(path,allow_pickle=False) as saved:np.testing.assert_array_equal(saved['normal_target'],tensor.numpy())
+ assert receipt['arrays']['normal_target']['shape']==[3,2]
+ with pytest.raises(FileExistsError):capture_initial_state(path,normal_target=tensor)

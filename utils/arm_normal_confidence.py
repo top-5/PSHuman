@@ -6,6 +6,18 @@ import torch
 import torch.nn.functional as F
 
 
+def capture_initial_state(path, **tensors):
+    """Save exact loaded tensors before optimization; refuse output replacement."""
+    arrays = {name: value.detach().cpu().contiguous().numpy() for name, value in tensors.items()}
+    output = Path(path)
+    with output.open('xb') as stream:
+        np.savez(stream, **arrays)
+    return {'path': str(output), 'sha256': hashlib.sha256(output.read_bytes()).hexdigest(),
+            'arrays': {name: {'shape': list(value.shape), 'dtype': value.dtype.str,
+                              'sha256': hashlib.sha256(value.tobytes()).hexdigest()}
+                       for name, value in arrays.items()}}
+
+
 def topology_digest(faces):
     arr = np.asarray(faces)
     if arr.ndim != 2 or arr.shape[1] != 3 or arr.dtype.kind not in 'iu' or (arr.size and arr.dtype.kind == 'u' and arr.max() > np.iinfo(np.int64).max):

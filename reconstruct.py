@@ -2423,6 +2423,15 @@ class ReMesh:
                 "viewOrder": self.views, "snapshots": [],
                 "scope": "Counts are visible rasterized transported labels; unlabeled pixels are unknown.",
             }
+            initial_state_path = os.environ.get("PSHUMAN_ARM_NORMAL_INITIAL_STATE_NPZ", "").strip()
+            if initial_state_path:
+                from utils.arm_normal_confidence import capture_initial_state
+                arm_report["initialState"] = capture_initial_state(
+                    initial_state_path, vertices=nrm_opt.vertices, faces=nrm_opt.faces,
+                    optimizer_state=nrm_opt._vertices_etc, alpha_target=masks,
+                    normal_target=target_normals, view_weights=self.weights,
+                    world_to_clip=self.renderer.mvp,
+                )
         vertices, faces = nrm_opt.vertices, nrm_opt.faces
 
         # ---- synthetic acceptance check for cross-view depth loss ------------
