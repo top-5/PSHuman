@@ -91,7 +91,10 @@ def run(manifest_path, manifest_sha256, output, *, min_source_support=.95, resol
     mesh, baseline = load_mesh(inputs['mesh']), load_mesh(inputs['baseline'])
     if not np.array_equal(np.asarray(mesh.vertices), np.asarray(baseline.vertices)) or not np.array_equal(np.asarray(mesh.faces), np.asarray(baseline.faces)):
         raise ValueError('baseline indexed geometry does not exactly match the input mesh')
-    verts_np = np.asarray(mesh.vertices, dtype=np.float32)
+    source_vertices = np.asarray(mesh.vertices)
+    verts_np = np.asarray(source_vertices, dtype=np.float32)
+    if not np.isfinite(verts_np).all() or not np.array_equal(verts_np.astype(source_vertices.dtype), source_vertices):
+        raise ValueError('mesh coordinates must round-trip exactly through float32')
     faces_np = np.asarray(mesh.faces, dtype=np.int64)
     vertices = torch.as_tensor(verts_np, device=device)
     faces = torch.as_tensor(faces_np, device=device)
@@ -102,6 +105,8 @@ def run(manifest_path, manifest_sha256, output, *, min_source_support=.95, resol
     colors = validate_baseline_colors(vertices, faces, baseline_data)
     views = [Image.open(p).convert('RGBA') for p in inputs['colors']]
     normals = [Image.open(p).convert('RGBA') for p in inputs['normals']]
+    if any(color.size != normal.size for color, normal in zip(views, normals, strict=True)):
+        raise ValueError('each normal image must match its paired color dimensions')
     observed, _inferred = load_support(inputs['support'], manifest['support']['sha256'], views)
     measured = masked_images(views, observed)
     def tensor(image):

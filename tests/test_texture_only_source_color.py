@@ -45,3 +45,27 @@ def test_texture_only_output_retains_baseline_and_rejects_reuse(tmp_path,monkeyp
     assert report['measured_vertices']==0 and report['baseline_vertices']==3
     assert np.array_equal(driver.load_mesh(output/'texture-only.ply').visual.vertex_colors[:,:3],np.array([[10,20,30],[40,50,60],[70,80,90]],np.uint8))
     with pytest.raises(FileExistsError): driver.run(p,driver.digest(p),output,device='cpu',resolution=9)
+
+
+def test_normal_color_source_size_mismatch_rejected(tmp_path,monkeypatch):
+    from utils import project_mesh
+    p,m=fixture(tmp_path)
+    normal=tmp_path/'front_face-normal.png'
+    Image.fromarray(np.full((7,9,4),255,np.uint8)).save(normal)
+    m['views'][0]['normal']['sha256']=driver.digest(normal)
+    p.write_text(json.dumps(m))
+    monkeypatch.setattr(project_mesh,'get_cameras_list',lambda *a,**kw: [None]*6)
+    with pytest.raises(ValueError,match='normal image.*paired color'):
+        driver.run(p,driver.digest(p),tmp_path/'out',device='cpu',resolution=9)
+    assert not (tmp_path/'out').exists()
+
+
+def test_nonrepresentable_geometry_rejected_before_projection(tmp_path):
+    p,m=fixture(tmp_path)
+    obj=tmp_path/'mesh.obj'
+    obj.write_text('v 0.1 0 1 0.2 0.3 0.4\nv 1 0 1 0.3 0.4 0.5\nv 0 1 1 0.4 0.5 0.6\nf 1 2 3\n')
+    m['mesh']={'path':str(obj),'sha256':driver.digest(obj)}
+    p.write_text(json.dumps(m))
+    with pytest.raises(ValueError,match='round-trip exactly'):
+        driver.run(p,driver.digest(p),tmp_path/'out',device='cpu',resolution=9)
+    assert not (tmp_path/'out').exists()
