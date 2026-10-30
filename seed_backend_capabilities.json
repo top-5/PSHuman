@@ -7,6 +7,12 @@
       "priorHashBehavior": "required_and_must_match_loaded_prior",
       "environmentVariable": "PSHUMAN_ARM_NORMAL_CONFIDENCE_NPZ",
       "reportField": "priorBinding"
+    },
+    "source_texture_raster": {
+      "version": 1,
+      "frozenAcrossViewsAndPasses": true,
+      "binCapacityMode": "all_faces_or_default",
+      "bufferLimitBytes": "enforced_for_all_faces"
     }
   }
 }
