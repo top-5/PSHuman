@@ -16,7 +16,7 @@ from pytorch3d.renderer import (
 )
 from pytorch3d.renderer import MeshRasterizer
 
-def render_pix2faces_py3d(meshes, cameras, H=512, W=512, blur_radius=0.0, faces_per_pixel=1):
+def render_pix2faces_py3d(meshes, cameras, H=512, W=512, blur_radius=0.0, faces_per_pixel=1, bin_size=None):
     """
     Renders pix2face of visible faces.
 
@@ -35,7 +35,8 @@ def render_pix2faces_py3d(meshes, cameras, H=512, W=512, blur_radius=0.0, faces_
     raster_settings = RasterizationSettings(
         image_size=(H, W),
         blur_radius=blur_radius,
-        faces_per_pixel=faces_per_pixel
+        faces_per_pixel=faces_per_pixel,
+        bin_size=bin_size
     )
     rasterizer=MeshRasterizer(
         cameras=cameras, 
@@ -102,7 +103,14 @@ def get_visible_faces(meshes: Meshes, cameras: CamerasBase, resolution=1024):
     return unique_faces
 
 def get_visibility_buffers(meshes: Meshes, cameras: CamerasBase, resolution=1024):
-    return render_pix2faces_py3d(meshes, cameras, H=resolution, W=resolution)
+    # CUDA coarse bins can overflow and omit visibility/depth fragments. The
+    # explicit naive mode uses PyTorch3D's unbinned exact rasterizer and avoids
+    # bin allocation entirely, at potentially substantial compute cost.
+    mode = os.environ.get("PSHUMAN_TEXTURE_RASTER_MODE", "default").strip().lower()
+    if mode not in {"default", "naive"}:
+        raise ValueError("PSHUMAN_TEXTURE_RASTER_MODE must be default or naive")
+    bin_size = 0 if mode == "naive" else None
+    return render_pix2faces_py3d(meshes, cameras, H=resolution, W=resolution, bin_size=bin_size)
 
 def project_color(
     meshes: Meshes,
