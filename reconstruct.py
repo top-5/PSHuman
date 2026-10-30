@@ -2395,12 +2395,34 @@ class ReMesh:
         arm_normal_binding = os.environ.get("PSHUMAN_ARM_NORMAL_CONFIDENCE_NPZ", "").strip()
         arm_normal_enabled = bool(arm_normal_binding)
         if arm_normal_enabled:
-            from utils.arm_normal_confidence import attach, remap_weights
+            import hashlib
+            import utils.arm_normal_confidence as arm_confidence_module
+            from utils.arm_normal_confidence import attach, remap_weights, remap_known_non_arm
+            arm_attenuation = float(os.environ.get("PSHUMAN_ARM_NORMAL_ATTENUATION", "0"))
+            arm_dilation = int(os.environ.get("PSHUMAN_ARM_NORMAL_DILATION", "8"))
+            if not np.isfinite(arm_attenuation) or not 0 <= arm_attenuation <= 1 or not 0 <= arm_dilation <= 256:
+                raise ValueError("invalid arm-normal attenuation or dilation")
             arm_weights = remap_weights(
                 arm_normal_binding, outer_f.detach().cpu().numpy(), int(outer_v.shape[0]),
                 outer_ids.detach().cpu().numpy(), nrm_opt.faces.detach().cpu().numpy(),
             )
-            attach(nrm_opt, arm_weights)
+            known_non_arm = remap_known_non_arm(
+                arm_normal_binding, outer_f.detach().cpu().numpy(), int(outer_v.shape[0]),
+                outer_ids.detach().cpu().numpy(), arm_weights,
+            )
+            attach(nrm_opt, arm_weights, known_non_arm)
+            _sha = lambda b: hashlib.sha256(b).hexdigest()
+            arm_report = {
+                "bindingSha256": _sha(open(arm_normal_binding, "rb").read()),
+                "reconstructSha256": _sha(open(__file__, "rb").read()),
+                "confidenceHelperSha256": _sha(open(arm_confidence_module.__file__, "rb").read()),
+                "loadedMaskSha256": _sha(masks.detach().cpu().contiguous().numpy().tobytes()),
+                "loadedNormalTargetSha256": _sha(target_normals.detach().cpu().contiguous().numpy().tobytes()),
+                "attenuation": arm_attenuation, "dilationPixels": arm_dilation,
+                "knownNonArmProvided": known_non_arm is not None,
+                "viewOrder": self.views, "snapshots": [],
+                "scope": "Counts are visible rasterized transported labels; unlabeled pixels are unknown.",
+            }
         vertices, faces = nrm_opt.vertices, nrm_opt.faces
 
         # ---- synthetic acceptance check for cross-view depth loss ------------
@@ -2454,10 +2476,17 @@ class ReMesh:
             # if i < 800:
             if arm_normal_enabled:
                 from utils.arm_normal_confidence import normal_confidence
-                confidence = normal_confidence(
+                capture_stats = i == 0 or i + 1 == self.opt.iters
+                confidence_result = normal_confidence(
                     self.renderer, vertices, faces, nrm_opt._vertices_etc,
-                    nrm[..., 3:], dilation=8,
+                    nrm[..., 3:], dilation=arm_dilation, attenuation=arm_attenuation,
+                    return_stats=capture_stats,
                 )
+                if capture_stats:
+                    confidence, confidence_stats = confidence_result
+                    arm_report["snapshots"].append({"iteration": i + 1, **confidence_stats})
+                else:
+                    confidence = confidence_result
                 loss = ((normals-target_normals) * self.weights * confidence).abs().mean()
             else:
                 loss = ((normals-target_normals) * self.weights).abs().mean()
@@ -2517,6 +2546,9 @@ class ReMesh:
                 # mesh_remeshed.export(f'{case_path}/{case}_remeshed_step{i}.obj')
             torch.cuda.empty_cache() 
             
+        if arm_normal_enabled:
+            with open(os.path.join(case_path, "arm_normal_confidence.json"), "w") as _out:
+                json.dump(arm_report, _out, indent=2)
         mesh_remeshed = trimesh.Trimesh(vertices=vertices.detach().cpu().numpy(), faces=faces.detach().cpu().numpy())
         mesh_remeshed.export(f'{case_path}/{case}_remeshed.obj')
         # save_mesh(case, vertices, faces)

@@ -36,3 +36,29 @@ def test_outer_compaction_mapping_and_wrong_topology(tmp_path):
  with pytest.raises(ValueError):remap_weights(p,full,6,np.array([0,1,2]),np.array([[0,2,1]]))
  with pytest.raises(ValueError):remap_weights(p,full,6,np.array([0,1,2]),np.array([[0,1,2],[0,1,2]]))
  with pytest.raises(ValueError):remap_weights(p,np.array([[0,2,1],[3,4,5]]),6,np.array([0,1,2]),np.array([[0,1,2]]))
+
+def test_optional_known_label_remap_and_conflicts(tmp_path):
+ from utils.arm_normal_confidence import remap_known_non_arm
+ p=tmp_path/'x.npz';bind(p,vertex_ids=np.array([0]),known_non_arm_ids=np.array([2]))
+ np.testing.assert_array_equal(remap_known_non_arm(p,FACES,3,np.arange(3),np.array([1,0,0])),[0,0,1])
+ with pytest.raises(ValueError): remap_known_non_arm(p,FACES,3,np.arange(3),np.array([0,0,1]))
+ bind(p,vertex_ids=np.array([0]));assert remap_known_non_arm(p,FACES,3,np.arange(3),np.array([1,0,0])) is None
+
+def test_configurable_weight_spill_and_unknown():
+ class ColoredRenderer:
+  def render(self,v,f,colors):
+   o=torch.zeros((1,5,5,4));o[0,2,2,0]=1;o[0,2,3,1]=1;return o
+ v=torch.zeros((3,3));f=torch.tensor(FACES);state=torch.zeros((3,11));alpha=torch.ones((1,5,5,1));result,stats=normal_confidence(ColoredRenderer(),v,f,state,alpha,dilation=1,attenuation=.25,return_stats=True)
+ assert result[0,2,2,0]==.25 and result[0,0,0,0]==1
+ assert stats['maskedPixelsByView']==[9] and stats['knownNonArmSpillByView']==[1] and stats['unknownMaskedPixelsByView']==[7]
+ for invalid in (-1.,1.1,float('nan'),True):
+  with pytest.raises(ValueError): normal_confidence(ColoredRenderer(),v,f,state,alpha,attenuation=invalid)
+
+def test_attach_preserves_extra_state_across_split():
+ from utils.arm_normal_confidence import attach
+ class Optimizer:
+  def __init__(self):self._vertices_etc=torch.zeros((3,9))
+  def _split_vertices_etc(self):self._vertices=self._vertices_etc[:,:3]
+ o=Optimizer();attach(o,np.array([1,0,0]),np.array([0,0,1]));assert o._vertices_etc.shape==(3,11)
+ copied=o._vertices_etc[[0,2,1]].detach().clone();o._vertices_etc=copied;o._split_vertices_etc()
+ assert o._vertices_etc[:,9].tolist()==[1,0,0] and o._vertices_etc[:,10].tolist()==[0,1,0]
