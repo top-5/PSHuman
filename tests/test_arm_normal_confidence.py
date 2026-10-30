@@ -62,3 +62,22 @@ def test_attach_preserves_extra_state_across_split():
  o=Optimizer();attach(o,np.array([1,0,0]),np.array([0,0,1]));assert o._vertices_etc.shape==(3,11)
  copied=o._vertices_etc[[0,2,1]].detach().clone();o._vertices_etc=copied;o._split_vertices_etc()
  assert o._vertices_etc[:,9].tolist()==[1,0,0] and o._vertices_etc[:,10].tolist()==[0,1,0]
+
+def test_refuse_fractional_and_bool_counts_and_complex_bool_weights(tmp_path):
+ p=tmp_path/'x.npz'
+ for count in (3.9,3.0,True):
+  np.savez(p,faces_sha256=topology_digest(FACES),vertex_count=count,vertex_ids=np.array([0]))
+  with pytest.raises(ValueError): load_weights(p,FACES,3)
+ for weights in (np.array([1+2j,0j,0j]),np.array([True,False,False])):
+  bind(p,weights=weights)
+  with pytest.raises(ValueError):load_weights(p,FACES,3)
+
+def test_reject_bad_threshold_and_nonfinite_transported_state():
+ v=torch.zeros((3,3));f=torch.tensor(FACES);state=torch.zeros((3,10));alpha=torch.ones((1,5,5,1))
+ for bad in (True,-.1,1.1,float('nan')):
+  with pytest.raises(ValueError):normal_confidence(Renderer(),v,f,state,alpha,threshold=bad)
+ state[0,9]=float('nan')
+ with pytest.raises(ValueError):normal_confidence(Renderer(),v,f,state,alpha)
+
+def test_attenuation_one_preserves_loss_and_alpha():
+ v=torch.zeros((3,3));f=torch.tensor(FACES);state=torch.zeros((3,10));alpha=torch.ones((1,5,5,1));before=alpha.clone();res=normal_confidence(Renderer(),v,f,state,alpha,dilation=1,attenuation=1.0);assert torch.equal(res,torch.ones_like(res));assert torch.equal(alpha,before)

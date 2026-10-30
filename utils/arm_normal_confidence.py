@@ -8,9 +8,16 @@ import torch.nn.functional as F
 
 def topology_digest(faces):
     arr = np.asarray(faces)
-    if arr.ndim != 2 or arr.shape[1] != 3 or not np.issubdtype(arr.dtype, np.integer):
+    if arr.ndim != 2 or arr.shape[1] != 3 or arr.dtype.kind not in 'iu' or (arr.size and arr.dtype.kind == 'u' and arr.max() > np.iinfo(np.int64).max):
         raise ValueError('faces must be integer triangles')
     return hashlib.sha256(np.ascontiguousarray(arr, dtype='<i8').tobytes()).hexdigest()
+
+
+def _binding_count(value):
+    item = np.asarray(value)
+    if item.shape != () or item.dtype.kind not in 'iu':
+        raise ValueError('binding vertex_count must be an integer scalar')
+    return int(item.item())
 
 
 def load_weights(path, faces, vertex_count):
@@ -21,7 +28,7 @@ def load_weights(path, faces, vertex_count):
     if a.size == 0 or a.min() < 0 or a.max() >= vertex_count:
         raise ValueError('faces out of range')
     with np.load(Path(path), allow_pickle=False) as d:
-        if str(d['faces_sha256'].item()) != digest or int(d['vertex_count'].item()) != vertex_count:
+        if str(d['faces_sha256'].item()) != digest or _binding_count(d['vertex_count']) != vertex_count:
             raise ValueError('topology binding mismatch')
         if ('weights' in d) == ('vertex_ids' in d):
             raise ValueError('supply exactly one of weights or vertex_ids')
@@ -32,7 +39,7 @@ def load_weights(path, faces, vertex_count):
             w = np.zeros(vertex_count,np.float32); w[ids] = 1
         else:
             w = np.asarray(d['weights'])
-            if w.shape != (vertex_count,) or not np.issubdtype(w.dtype,np.number) or not np.isfinite(w).all() or np.any((w < 0) | (w > 1)) or not np.any(w > 0):
+            if w.shape != (vertex_count,) or w.dtype.kind not in 'fiu' or not np.isfinite(w).all() or np.any((w < 0) | (w > 1)) or not np.any(w > 0):
                 raise ValueError('invalid weights')
             w = w.astype(np.float32)
     return w
@@ -43,6 +50,8 @@ def attach(optimizer, weights, known_non_arm=None):
     if state.ndim != 2 or state.shape[1] != 9 or len(weights) != len(state):
         raise ValueError('unsupported optimizer state or weight count')
     part = torch.as_tensor(weights, dtype=state.dtype, device=state.device).reshape(-1, 1)
+    if not bool(torch.isfinite(part).all()) or bool(((part < 0) | (part > 1)).any()):
+        raise ValueError('invalid arm weights')
     channels = [state.detach(), part]
     if known_non_arm is not None:
         known = torch.as_tensor(known_non_arm, dtype=state.dtype, device=state.device).reshape(-1, 1)
@@ -57,6 +66,10 @@ def attach(optimizer, weights, known_non_arm=None):
 def normal_confidence(renderer, vertices, faces, state, alpha, dilation=8, threshold=.75, attenuation=0.0, return_stats=False):
     if state.ndim != 2 or state.shape[1] not in (10, 11) or state.shape[0] != vertices.shape[0]:
         raise ValueError('invalid transported optimizer state')
+    if not bool(torch.isfinite(state[:,9:]).all()):
+        raise ValueError('nonfinite transported part state')
+    if isinstance(threshold, bool) or not isinstance(threshold, (float, int)) or not np.isfinite(threshold) or not 0 <= threshold <= 1:
+        raise ValueError('invalid threshold')
     if type(dilation) is not int or not 0 <= dilation <= 256:
         raise ValueError('invalid dilation')
     if isinstance(attenuation, bool) or not isinstance(attenuation, (float, int)) or not np.isfinite(attenuation) or not 0 <= attenuation <= 1:
@@ -105,7 +118,7 @@ def remap_weights(path, source_faces, source_vertex_count, kept_ids, compact_fac
 def remap_known_non_arm(path, source_faces, source_vertex_count, kept_ids, arm_weights):
     """Return optional explicit non-arm vertex labels; never infer unknown labels."""
     with np.load(Path(path), allow_pickle=False) as d:
-        if str(d['faces_sha256'].item()) != topology_digest(source_faces) or int(d['vertex_count'].item()) != source_vertex_count:
+        if str(d['faces_sha256'].item()) != topology_digest(source_faces) or _binding_count(d['vertex_count']) != source_vertex_count:
             raise ValueError('topology binding mismatch')
         if 'known_non_arm_ids' not in d:
             return None
