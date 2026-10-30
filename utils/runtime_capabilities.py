@@ -22,7 +22,10 @@ _REQUIRED = (
     "utils/arm_normal_confidence.py", "utils/soma_prior.py",
     "utils/runtime_capabilities.py", "lib/dataset/mesh_util.py",
 )
-_SUFFIXES = {".py", ".cu", ".cuh", ".cpp", ".h", ".hpp", ".yaml", ".yml", ".json"}
+_SUFFIXES = {
+    ".py", ".cu", ".cuh", ".cpp", ".h", ".hpp", ".yaml", ".yml", ".json",
+    ".txt", ".toml", ".ini", ".cfg", ".sh",
+}
 _CHECKS = frozenset({
     "consumed_prior_bytes", "explicit_preinset_carve", "fallback_carve",
     "same_prior_binding", "swapped_prior_refused", "absent_prior_refused", "malformed_hash_refused",
