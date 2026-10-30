@@ -1101,7 +1101,10 @@ class ReMesh:
         return renderer
     
     @seed_spans.profile_stage('texture projection')
-    def proj_texture(self, fused_images, vertices, faces, normal_images=None):
+    def proj_texture(self, fused_images, vertices, faces, normal_images=None, fallback_images=None, source_only=False,
+                     support_silhouettes=None):
+        if source_only and support_silhouettes is None:
+            raise ValueError("source-only projection requires original silhouette alpha")
         mesh = to_py3d_mesh(vertices, faces)
         mesh = mesh.to(self.device)
         camera_focal =  1/2
@@ -1130,15 +1133,20 @@ class ReMesh:
             f"side_occlusion_indices={side_occlusion_indices}",
             flush=True,
         )
-        mesh = multiview_color_projection(
+        if source_only:
+            from pytorch3d.renderer import TexturesVertex
+            mesh.textures = TexturesVertex(verts_features=[torch.full_like(vertices, 0.5)])
+        def project(mesh, images):
+            return multiview_color_projection(
             mesh,
-            fused_images,
+            images,
             normal_image_list=normal_images,
             camera_focal=camera_focal,
             resolution=self.resolution,
             weights=self.weights.squeeze().cpu().numpy(),
             device=self.device,
-            complete_unseen=True,
+            complete_unseen=not source_only,
+            below_confidence_strategy="original" if source_only else "smooth",
             confidence_threshold=0.2,
             cameras_list=cameras_list,
             normal_gate_threshold=normal_gate_threshold,
@@ -1149,7 +1157,11 @@ class ReMesh:
             alpha_edge_threshold=alpha_edge_threshold,
             side_occlusion_indices=side_occlusion_indices,
             side_occlusion_guard=side_occlusion_guard,
+            support_silhouettes=support_silhouettes,
         )
+        if fallback_images is not None:
+            mesh = project(mesh, fallback_images)
+        mesh = project(mesh, fused_images)
         return mesh
     
     def get_invisible_idx(self, imgs, vertices, faces):
@@ -2697,6 +2709,21 @@ class ReMesh:
         vertices = torch.from_numpy(final.vertices).float().to(self.device)
         faces = torch.from_numpy(final.faces).long().to(self.device)
         # Differing from paper, we use the texturing method in Unique3D
+        source_only = _env_bool("PSHUMAN_SOURCE_COLOR_ONLY", False)
+        fallback_color = None
+        support_silhouettes = None
+        if source_only:
+            # Preserve the original foreground alpha separately from the sparse
+            # observed/inferred RGB contribution masks used by each pass.
+            support_silhouettes = [torch.from_numpy(np.array(tmp.resize((self.resolution, self.resolution), Image.BILINEAR)).astype(np.float32) / 255.).permute(2, 0, 1).to(self.device) for tmp in clr_img]
+            from utils.source_color_support import load_support, masked_images
+            support_path = os.environ.get("PSHUMAN_SOURCE_COLOR_SUPPORT", "")
+            support_sha = os.environ.get("PSHUMAN_SOURCE_COLOR_SUPPORT_SHA256", "")
+            if not support_path or not support_sha:
+                raise ValueError("Source-only color requires a hash-bound support file")
+            observed, inferred = load_support(support_path, support_sha, clr_img)
+            fallback_color = masked_images(clr_img, inferred)
+            clr_img = masked_images(clr_img, observed)
         masked_color = []
         masked_normals = []
         for tmp in clr_img:
@@ -2709,7 +2736,12 @@ class ReMesh:
             tmp = np.array(tmp).astype(np.float32) / 255.
             masked_normals.append(torch.from_numpy(tmp).permute(2, 0, 1).to(self.device))
 
-        meshes = self.proj_texture(masked_color, vertices, faces, normal_images=masked_normals)
+        masked_fallback = None
+        if fallback_color is not None:
+            masked_fallback = [torch.from_numpy(np.array(tmp.resize((self.resolution, self.resolution), Image.BILINEAR)).astype(np.float32) / 255.).permute(2, 0, 1).to(self.device) for tmp in fallback_color]
+        meshes = self.proj_texture(masked_color, vertices, faces, normal_images=masked_normals,
+                                   fallback_images=masked_fallback, source_only=source_only,
+                                   support_silhouettes=support_silhouettes)
         vertices = meshes.verts_packed().float()
         faces = meshes.faces_packed().long()
         colors = meshes.textures.verts_features_packed().float()

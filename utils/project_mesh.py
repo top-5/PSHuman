@@ -119,6 +119,7 @@ def project_color(
     depth_edge_dilate_px=0,
     alpha_erode_px=0,
     alpha_edge_threshold=0.95,
+    support_silhouette=None,
 ) -> dict:
     """
     Projects color from a given image onto a 3D mesh.
@@ -263,11 +264,20 @@ def project_color(
             "normal_gate": torch.empty((0, 1), device=device, dtype=meshes.verts_packed().dtype),
             "vertex_visible": vertex_visible,
         }
-    valid_color = torch.nn.functional.grid_sample(image[None].flip((-1, -2)), valid_pt[None, :, None, :], align_corners=False, padding_mode="border", mode="bilinear")[0, :, :, 0].T.clamp(0, 1)   # [N, 4], note that bicubic may give invalid value
-    alpha, valid_color = valid_color[:, 3:], valid_color[:, :3]
+    if support_silhouette is not None:
+        if not use_alpha:
+            raise ValueError("separate source support requires alpha sampling")
+        from utils.source_color_sampling import sample_source_color
+        valid_color, alpha = sample_source_color(
+            image, support_silhouette, valid_pt,
+            alpha_erode_px=int(alpha_erode_px), alpha_edge_threshold=alpha_edge_threshold,
+        )
+    else:
+        valid_color = torch.nn.functional.grid_sample(image[None].flip((-1, -2)), valid_pt[None, :, None, :], align_corners=False, padding_mode="border", mode="bilinear")[0, :, :, 0].T.clamp(0, 1)   # [N, 4], note that bicubic may give invalid value
+        alpha, valid_color = valid_color[:, 3:], valid_color[:, :3]
     if not use_alpha:
         alpha = torch.ones_like(alpha)
-    elif alpha_erode_px > 0:
+    elif support_silhouette is None and alpha_erode_px > 0:
         # Reject samples close to source RGBA cutout edges. Those pixels are
         # where side-view arm/background antialiasing most often bleeds into
         # dark clothing vertices.
@@ -393,6 +403,7 @@ def multiview_color_projection(
     alpha_edge_threshold=0.95,
     side_occlusion_indices=None,
     side_occlusion_guard=True,
+    support_silhouettes=None,
 ) -> Meshes:
     """
     Projects color from a given image onto a 3D mesh.
@@ -419,6 +430,8 @@ def multiview_color_projection(
         raise ValueError("image_list is None")
     if normal_image_list is not None and len(normal_image_list) != len(image_list):
         raise ValueError("normal_image_list must have the same length as image_list")
+    if support_silhouettes is not None and len(support_silhouettes) != len(image_list):
+        raise ValueError("support_silhouettes must have the same length as image_list")
     if cameras_list is None:
         if len(image_list) == 8:
             cameras_list = get_8view_cameras(device, focal=camera_focal)
@@ -482,6 +495,7 @@ def multiview_color_projection(
             depth_edge_dilate_px=view_depth_edge_dilate_px,
             alpha_erode_px=alpha_erode_px,
             alpha_edge_threshold=alpha_edge_threshold,
+            support_silhouette=support_silhouettes[view_i] if support_silhouettes is not None else None,
         )
         if "vertex_visible" in ret:
             vertex_visible = ret["vertex_visible"]
