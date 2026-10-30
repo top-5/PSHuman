@@ -114,15 +114,52 @@ def _reference_scatter_max(src: torch.Tensor, index: torch.Tensor, dim: int, out
 
 
 _verified_calls = 0
+#: why PSHUMAN_FAST_MESH=1 runs the reference reduction instead, once known (None = not fallen back)
+fast_mesh_fallback = None
+
+
+def _fast_integer_scatter_max():
+    """seed's native integer rank max, or None after recording why it is unavailable.
+
+    The fast kernel lives in seed (seed.mesh_ops), which this fork's own Python environment reaches only through the
+    runner's PYTHONPATH; a runner without it crashed every 10-27 suprim build in remesh (#394). The reference reduction
+    gives the same integers, so the run continues, but never silently: a slow path must not hide inside a speed
+    baseline. The first fallback warns and leaves a "fast_mesh: reference fallback (<reason>)" span in the run's trace.
+    """
+    global fast_mesh_fallback
+    if fast_mesh_fallback is not None:
+        return None
+    try:
+        from seed.mesh_ops.gpu_reductions import integer_scatter_max
+    except ImportError as exc:
+        fast_mesh_fallback = f"{type(exc).__name__}: {exc}"
+        message = f"fast_mesh: reference fallback ({fast_mesh_fallback})"
+        import warnings
+
+        warnings.warn(message + "; PSHUMAN_FAST_MESH=1 asked for seed's native integer rank max", RuntimeWarning)
+        print(f"[remesh] {message}", flush=True)
+        try:
+            import seed_spans
+        except ImportError:  # a fork checkout used without seed: the warning above is the record
+            return None
+        import time
+
+        now = time.time_ns()
+        seed_spans.emit(message, now, now, fast_mesh="reference_fallback", reason=fast_mesh_fallback)
+        return None
+    return integer_scatter_max
+
 
 def scatter_max(src, index, dim, out):
     global _verified_calls
     if dim != 0:
         raise NotImplementedError("only dim=0 is used")
     index = _broadcast_index(index, src)
+    integer_scatter_max = None
     if (os.environ.get('PSHUMAN_FAST_MESH') == '1' and src.is_cuda
             and src.dtype in (torch.int32, torch.int64)):
-        from seed.mesh_ops.gpu_reductions import integer_scatter_max
+        integer_scatter_max = _fast_integer_scatter_max()
+    if integer_scatter_max is not None:
         verify = os.environ.get('PSHUMAN_FAST_VERIFY') == '1'
         reference = _reference_scatter_max(src, index, dim, out.clone()) if verify else None
         result = integer_scatter_max(src, index, out)
@@ -139,7 +176,7 @@ def _write_verification():
     if path:
         import json
         from pathlib import Path
-        Path(path).write_text(json.dumps(dict(exact_checked_calls=_verified_calls,
+        Path(path).write_text(json.dumps(dict(exact_checked_calls=_verified_calls, reference_fallback=fast_mesh_fallback,
             scope='integer rank arrays on identical live inputs; not full mesh parity'), indent=2)+'\n')
 
 import atexit
