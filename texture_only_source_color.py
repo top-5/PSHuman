@@ -9,6 +9,7 @@ import json
 import os
 import time
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
 from PIL import Image
@@ -83,6 +84,10 @@ def run(manifest_path, manifest_sha256, output, *, min_source_support=.95, resol
     from utils.texture_raster_budget import source_raster_policy
 
     raster_policy = source_raster_policy(os.environ)
+    raster_env = {'PSHUMAN_TEXTURE_RASTER_MODE': raster_policy['mode']}
+    if raster_policy['bin_buffer_limit_bytes'] is not None:
+        raster_env['PSHUMAN_TEXTURE_BIN_BUFFER_MAX_BYTES'] = str(raster_policy['bin_buffer_limit_bytes'])
+    raster_env = MappingProxyType(raster_env)
     started = time.perf_counter()
     if Path(output).exists():
         raise FileExistsError(f"output already exists: {output}")
@@ -126,7 +131,8 @@ def run(manifest_path, manifest_sha256, output, *, min_source_support=.95, resol
         complete_unseen=False, below_confidence_strategy='original', normal_gate_threshold=.65,
         depth_tol=.01, depth_edge_tol=.006, depth_edge_dilate_px=12,
         alpha_erode_px=4, alpha_edge_threshold=.95, side_occlusion_indices=[1,2,4,5],
-        support_silhouettes=silhouette, min_source_support=min_source_support, support_counts_out=result_counts)
+        support_silhouettes=silhouette, min_source_support=min_source_support, support_counts_out=result_counts,
+        source_raster_env=raster_env)
     torch.cuda.synchronize() if device.startswith('cuda') else None
     projection_seconds = time.perf_counter() - projection_start
     mask = result_counts['measured_mask'].numpy()
@@ -134,8 +140,6 @@ def run(manifest_path, manifest_sha256, output, *, min_source_support=.95, resol
     rgb = np.clip(np.rint(projected * 255), 0, 255).astype(np.uint8)
     if not np.array_equal(rgb[~mask], baseline_colors[~mask]):
         raise RuntimeError('unsupported baseline colors changed')
-    if source_raster_policy(os.environ) != raster_policy:
-        raise RuntimeError("source raster policy changed during projection")
     output = Path(output); output.mkdir(parents=True, exist_ok=False)
     result_mesh = trimesh.Trimesh(vertices=verts_np, faces=faces_np, vertex_colors=rgb, process=False)
     for name, kind in [('texture-only.ply','ply'), ('texture-only.glb','glb')]:

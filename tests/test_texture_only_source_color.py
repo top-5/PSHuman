@@ -75,17 +75,21 @@ def test_nonrepresentable_geometry_rejected_before_projection(tmp_path):
     assert not (tmp_path/'out').exists()
 
 
-def test_raster_policy_change_during_projection_refuses_output(tmp_path,monkeypatch):
+def test_raster_policy_is_frozen_despite_transient_environment_change(tmp_path,monkeypatch):
     import torch
     from utils import project_mesh
     p,_=fixture(tmp_path)
     monkeypatch.setenv('PSHUMAN_TEXTURE_RASTER_MODE','default')
     monkeypatch.setattr(project_mesh,'get_cameras_list',lambda *a,**kw: [None]*6)
     def project(mesh,*a,support_counts_out,**kw):
-        support_counts_out['measured_mask']=torch.tensor([False,False,False])
+        frozen=kw['source_raster_env']
+        assert frozen['PSHUMAN_TEXTURE_RASTER_MODE']=='default'
         monkeypatch.setenv('PSHUMAN_TEXTURE_RASTER_MODE','all_faces')
+        assert frozen['PSHUMAN_TEXTURE_RASTER_MODE']=='default'
+        with pytest.raises(TypeError): frozen['PSHUMAN_TEXTURE_RASTER_MODE']='all_faces'
+        monkeypatch.setenv('PSHUMAN_TEXTURE_RASTER_MODE','default')
+        support_counts_out['measured_mask']=torch.tensor([False,False,False])
         return mesh
     monkeypatch.setattr(project_mesh,'multiview_color_projection',project)
-    with pytest.raises(RuntimeError,match='raster policy changed'):
-        driver.run(p,driver.digest(p),tmp_path/'out',device='cpu',resolution=9)
-    assert not (tmp_path/'out').exists()
+    report=driver.run(p,driver.digest(p),tmp_path/'out',device='cpu',resolution=9)
+    assert report['source_raster']=={'mode':'default','bin_buffer_limit_bytes':None}

@@ -121,6 +121,7 @@ def project_color(
     alpha_erode_px=0,
     alpha_edge_threshold=0.95,
     support_silhouette=None,
+    source_raster_env=None,
 ) -> dict:
     """
     Projects color from a given image onto a 3D mesh.
@@ -147,7 +148,8 @@ def project_color(
     raster_options = None
     if support_silhouette is not None:
         from utils.texture_raster_budget import source_raster_options
-        raster_options = source_raster_options(meshes, cameras, resolution, resolution, os.environ)
+        raster_options = source_raster_options(meshes, cameras, resolution, resolution,
+                                               os.environ if source_raster_env is None else source_raster_env)
     if raster_options is None:
         visibility = get_visibility_buffers(meshes, cameras, resolution=resolution)
     else:
@@ -414,6 +416,7 @@ def multiview_color_projection(
     support_silhouettes=None,
     min_source_support=0.0,
     support_counts_out=None,
+    source_raster_env=None,
 ) -> Meshes:
     """
     Projects color from a given image onto a 3D mesh.
@@ -512,6 +515,7 @@ def multiview_color_projection(
             alpha_erode_px=alpha_erode_px,
             alpha_edge_threshold=alpha_edge_threshold,
             support_silhouette=support_silhouettes[view_i] if support_silhouettes is not None else None,
+            source_raster_env=source_raster_env,
         )
         if "vertex_visible" in ret:
             vertex_visible = ret["vertex_visible"]

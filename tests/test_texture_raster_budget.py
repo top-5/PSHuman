@@ -63,3 +63,49 @@ def test_only_separate_source_support_activates_options(monkeypatch):
     project_mesh.project_color(mesh,Camera(),image,resolution=9,device='cpu',depth_edge_tol=0.)
     project_mesh.project_color(mesh,Camera(),image,resolution=9,device='cpu',depth_edge_tol=0.,support_silhouette=image)
     assert calls==[None,{'bin_size':8,'max_faces_per_bin':3}]
+
+
+def test_explicit_policy_reaches_each_source_projection(monkeypatch):
+    import torch
+    from pytorch3d.structures import Meshes
+    from pytorch3d.renderer import TexturesVertex
+    from utils import project_mesh,texture_raster_budget
+    vertices=torch.tensor([[-.02,-.02,1.],[.02,-.02,1.],[0.,.02,1.]])
+    mesh=Meshes(verts=[vertices],faces=[torch.tensor([[0,1,2]])],textures=TexturesVertex(verts_features=[torch.zeros((3,3))]))
+    class Camera:
+        def to(self,device): return self
+        def unproject_points(self,p): return p
+        def transform_points(self,p): return p
+        def get_world_to_view_transform(self): return self
+    calls=[]
+    monkeypatch.setattr(project_mesh,'get_visibility_buffers',lambda *a,**k:{'pix_to_face':torch.zeros((1,9,9),dtype=torch.long),'zbuf':torch.ones((1,9,9))})
+    def policy(mesh,camera,h,w,env):
+        calls.append(dict(env));return None
+    monkeypatch.setattr(texture_raster_budget,'source_raster_options',policy)
+    image=torch.ones((4,9,9));frozen={'PSHUMAN_TEXTURE_RASTER_MODE':'default'}
+    monkeypatch.setenv('PSHUMAN_TEXTURE_RASTER_MODE','all_faces')
+    project_mesh.project_color(mesh,Camera(),image,resolution=9,device='cpu',depth_edge_tol=0.,support_silhouette=image,source_raster_env=frozen)
+    monkeypatch.setenv('PSHUMAN_TEXTURE_RASTER_MODE','default')
+    project_mesh.project_color(mesh,Camera(),image,resolution=9,device='cpu',depth_edge_tol=0.,support_silhouette=image,source_raster_env=frozen)
+    assert calls==[frozen,frozen]
+
+
+def test_multiview_forwards_frozen_policy_and_default_is_unchanged(monkeypatch):
+    import torch
+    from pytorch3d.structures import Meshes
+    from pytorch3d.renderer import TexturesVertex
+    from utils import project_mesh
+    mesh=Meshes(verts=[torch.tensor([[0.,0.,1.],[1.,0.,1.],[0.,1.,1.]])],faces=[torch.tensor([[0,1,2]])],textures=TexturesVertex(verts_features=[torch.zeros((3,3))]))
+    seen=[]
+    def project(*args,**kwargs):
+        seen.append(kwargs['source_raster_env'])
+        monkeypatch.setenv('PSHUMAN_TEXTURE_RASTER_MODE','all_faces')
+        return {'valid_verts':torch.empty((0,),dtype=torch.long)}
+    monkeypatch.setattr(project_mesh,'project_color',project)
+    images=[torch.ones((4,9,9)),torch.ones((4,9,9))]
+    frozen={'PSHUMAN_TEXTURE_RASTER_MODE':'default'}
+    project_mesh.multiview_color_projection(mesh,images,cameras_list=[None,None],weights=[1.,1.],device='cpu',support_silhouettes=images,source_raster_env=frozen)
+    assert seen==[frozen,frozen]
+    seen.clear()
+    project_mesh.multiview_color_projection(mesh,images,cameras_list=[None,None],weights=[1.,1.],device='cpu')
+    assert seen==[None,None]
