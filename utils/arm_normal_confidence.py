@@ -33,13 +33,15 @@ def _binding_count(value):
     return int(item.item())
 
 
-def verify_prior_binding(path, loaded_prior_sha256):
+def verify_prior_binding(path, loaded_prior_sha256, *, allow_unbound=False):
     """Check an optional declared prior hash against bytes actually loaded.
 
-    External bindings without a prior hash are accepted as explicitly unbound.
+    Hashless external bindings are refused unless a caller explicitly requests an unbound inspection.
     """
     with np.load(io.BytesIO(path) if isinstance(path, bytes) else Path(path), allow_pickle=False) as data:
         if 'prior_sha256' not in data:
+            if not allow_unbound:
+                raise ValueError('binding requires prior_sha256')
             return {'status': 'external_unbound', 'loadedPriorSha256': loaded_prior_sha256}
         value = np.asarray(data['prior_sha256'])
         if value.shape != () or value.dtype.kind not in 'US':

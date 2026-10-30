@@ -1,0 +1,12 @@
+{
+  "contract": "seed.pshuman.backend_capabilities.v1",
+  "features": {
+    "arm_normal_binding": {
+      "version": 1,
+      "samePriorSha256Verified": true,
+      "priorHashBehavior": "required_and_must_match_loaded_prior",
+      "environmentVariable": "PSHUMAN_ARM_NORMAL_CONFIDENCE_NPZ",
+      "reportField": "priorBinding"
+    }
+  }
+}
