@@ -1091,7 +1091,9 @@ class ReMesh:
     
     @seed_spans.profile_stage('texture projection')
     def proj_texture(self, fused_images, vertices, faces, normal_images=None, fallback_images=None, source_only=False,
-                     support_silhouettes=None):
+                     support_silhouettes=None, baseline_mesh_colors=None):
+        if baseline_mesh_colors is not None and not source_only:
+            raise ValueError("baseline colors require source-only projection")
         if source_only and support_silhouettes is None:
             raise ValueError("source-only projection requires original silhouette alpha")
         mesh = to_py3d_mesh(vertices, faces)
@@ -1124,7 +1126,12 @@ class ReMesh:
         )
         if source_only:
             from pytorch3d.renderer import TexturesVertex
-            mesh.textures = TexturesVertex(verts_features=[torch.full_like(vertices, 0.5)])
+            if baseline_mesh_colors is None:
+                initial_colors = torch.full_like(vertices, 0.5)
+            else:
+                from utils.source_color_sampling import validate_baseline_colors
+                initial_colors = validate_baseline_colors(vertices, faces, baseline_mesh_colors)
+            mesh.textures = TexturesVertex(verts_features=[initial_colors])
         def project(mesh, images):
             return multiview_color_projection(
             mesh,
@@ -1148,8 +1155,10 @@ class ReMesh:
             side_occlusion_guard=side_occlusion_guard,
             support_silhouettes=support_silhouettes,
         )
-        if fallback_images is not None:
+        if fallback_images is not None and baseline_mesh_colors is None:
             mesh = project(mesh, fallback_images)
+        elif fallback_images is not None:
+            print("[project_mesh] baseline retained for unsupported vertices; inferred fallback skipped", flush=True)
         mesh = project(mesh, fused_images)
         return mesh
     
