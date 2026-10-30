@@ -223,13 +223,18 @@ def project_color(
             dtype=valid_pt.dtype,
         ) * ndc_step
         neigh_pt = (valid_pt[:, None, :] + offsets[None, :, :]).clamp(-1.0, 1.0)
-        neigh_z = torch.nn.functional.grid_sample(
+        sampled_neigh_z = torch.nn.functional.grid_sample(
             zbuf_sample,
             neigh_pt[None, :, :, :],
             align_corners=False,
             padding_mode="zeros",
             mode="nearest",
-        )[0, :, :, 0].T
+        )
+        # [batch=1, channel=1, vertex, nine offsets]. The legacy color
+        # projection historically sampled only offset zero; keep that legacy
+        # behavior outside the explicitly source-supported path.
+        neigh_z = (sampled_neigh_z[0, 0, :, :] if support_silhouette is not None
+                   else sampled_neigh_z[0, :, :, 0].T)
         neigh_valid = neigh_z >= 0
         z_delta = torch.where(neigh_valid, (neigh_z - sampled_z).abs(), torch.zeros_like(neigh_z))
         local_depth_edge = z_delta.max(dim=1, keepdim=True).values > edge_tol
