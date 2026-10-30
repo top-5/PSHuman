@@ -2081,9 +2081,66 @@ def _fold_safe_normals(mesh):
     return int(fold.sum())
 
 
+class _PoissonStageCapture:
+    """Opt-in diagnostic stage snapshots; never changes the mesh handed to Poisson."""
+
+    def __init__(self, directory, input_mesh, depth, decimation):
+        import hashlib
+        import tempfile
+        from pathlib import Path
+
+        root = Path(directory).expanduser()
+        root.mkdir(parents=True, exist_ok=True)
+        self.directory = Path(tempfile.mkdtemp(prefix="poisson-", dir=root))
+        self._hashlib = hashlib
+        self.manifest = {
+            "schema": "pshuman.poisson-stage-capture.v1",
+            "status": "running",
+            "input_geometry": {},
+            "depth": int(depth),
+            "decimation": bool(decimation),
+            "mesh_util_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "fold_normals": os.environ.get("PSHUMAN_POISSON_FOLD_NORMALS", "1"),
+            "arm_rebuild": os.environ.get("PSHUMAN_ARM_FRONTAL_REBUILD", "1"),
+            "attract": os.environ.get("PSHUMAN_POISSON_ATTRACT_PARTS", "auto"),
+            "heal_joins": os.environ.get("PSHUMAN_POISSON_HEAL_JOINS", "1"),
+            "stages": [],
+        }
+        for name, values in (("vertices", input_mesh.vertices), ("faces", input_mesh.faces)):
+            array = np.ascontiguousarray(values)
+            self.manifest["input_geometry"][name] = {
+                "shape": list(array.shape), "dtype": str(array.dtype),
+                "sha256": hashlib.sha256(array.tobytes()).hexdigest(),
+            }
+        self._write()
+
+    def _write(self):
+        destination = self.directory / "manifest.json"
+        temporary = self.directory / "manifest.json.tmp"
+        temporary.write_text(json.dumps(self.manifest, indent=2) + "\n")
+        os.replace(temporary, destination)
+
+    def record(self, stage, mesh):
+        path = self.directory / (stage + ".ply")
+        mesh.export(path)
+        parts = mesh.split(only_watertight=False)
+        self.manifest["stages"].append({
+            "stage": stage, "file": path.name,
+            "sha256": self._hashlib.sha256(path.read_bytes()).hexdigest(),
+            "vertices": int(len(mesh.vertices)), "faces": int(len(mesh.faces)),
+            "components": int(len(parts)),
+            "component_faces": sorted((int(len(x.faces)) for x in parts), reverse=True),
+        })
+        if stage == "selected-output":
+            self.manifest["status"] = "complete"
+        self._write()
+
+
 @seed_spans.profile_stage('fusion Poisson inclusive')
 def poisson(mesh, obj_path, depth=10, decimation=True, front_mask=None, ortho_scale=None, report_path=None):
 
+    capture_dir = os.environ.get("PSHUMAN_POISSON_CAPTURE_DIR")
+    capture = _PoissonStageCapture(capture_dir, mesh, depth, decimation) if capture_dir else None
     assert (mesh.vertex_normals.shape[1] == 3)
     if os.environ.get("PSHUMAN_POISSON_FOLD_NORMALS", "1").strip().lower() not in {"0", "false", "no", "off"}:
         folds = _fold_safe_normals(mesh)
@@ -2112,6 +2169,9 @@ def poisson(mesh, obj_path, depth=10, decimation=True, front_mask=None, ortho_sc
             )
         os.remove(pcd_path)
         raw_mesh = trimesh.Trimesh(np.array(mesh.vertices), np.array(mesh.triangles), process=False)
+    if capture is not None:
+        capture.manifest["front_rebuild_used"] = arm_joins is not None
+        capture.record("raw-before-attract", raw_mesh)
     # Permanently disabled in this fork.
     #
     # The close-component bridge pass was a local experiment, not upstream
@@ -2127,6 +2187,9 @@ def poisson(mesh, obj_path, depth=10, decimation=True, front_mask=None, ortho_sc
     attract = os.environ.get("PSHUMAN_POISSON_ATTRACT_PARTS", "auto").strip().lower()
     if attract in {"1", "true", "yes", "on"} or (attract == "auto" and arm_joins is None):
         raw_mesh = attract_parts_to_body_plane(raw_mesh, depth=depth)
+    if capture is not None:
+        capture.manifest["attract_requested"] = attract in {"1", "true", "yes", "on"} or (attract == "auto" and arm_joins is None)
+        capture.record("post-attract-before-filter", raw_mesh)
     # After an arm re-attachment, an arm piece Poisson still left separate is KEPT (adjacent and
     # body-part sized), never dropped; the donor graft replaces the arm anyway.
     largest_mesh = keep_largest(
@@ -2140,8 +2203,12 @@ def poisson(mesh, obj_path, depth=10, decimation=True, front_mask=None, ortho_sc
     if decimation:
         # mesh decimation for faster rendering
         low_res_mesh = largest_mesh.simplify_quadratic_decimation(50000)
+        if capture is not None:
+            capture.record("selected-output", low_res_mesh)
         return low_res_mesh
     else:
+        if capture is not None:
+            capture.record("selected-output", largest_mesh)
         return largest_mesh
     
 
