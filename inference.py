@@ -764,17 +764,21 @@ def _soma_views_prior(save_dir: str, scene: str, view_names: List[str], colors, 
     # mv callback (on seeker the fit went out of memory beside it and the shared vLLM/Z-Image services)
     home = pipeline.unet.device if pipeline is not None else None
     if pipeline is not None:
-        try:
-            pipeline.to("cpu")
-        except Exception as exc:  # noqa: BLE001 - only memory is at stake
-            print(f"[soma] pipeline stays on {home}: {type(exc).__name__}: {exc}", flush=True)
-        torch.cuda.empty_cache()
+        with seed_spans.span("pshuman: diffusion pipeline to CPU for the SOMA fit"):
+            try:
+                pipeline.to("cpu")
+            except Exception as exc:  # noqa: BLE001 - only memory is at stake
+                print(f"[soma] pipeline stays on {home}: {type(exc).__name__}: {exc}", flush=True)
+            torch.cuda.empty_cache()
     try:
         with seed_spans.span("pshuman: SOMA body from the views (seed)"):
             subprocess.run(shlex.split(cmd) + [views_dir, out], check=True)
     finally:
         if pipeline is not None:
-            pipeline.to(home)
+            with seed_spans.span("pshuman: diffusion pipeline back to GPU after the SOMA fit"):
+                pipeline.to(home)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
     os.environ["PSHUMAN_BODY_PRIOR_NPZ"] = out
 
 
@@ -999,18 +1003,22 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
             # diffusion pipeline is idle until the next scene, so it waits on the CPU and the cached diffusion blocks
             # are released: on a 24 GB card they left the callback ~2 GB (suprim's 4090, 2026-10-05).
             home = pipeline.unet.device
-            try:
-                pipeline.to("cpu")
-            except Exception as exc:  # noqa: BLE001 - only memory is at stake
-                print(f"[mv-callback] pipeline stays on {home}: {type(exc).__name__}: {exc}", flush=True)
-            torch.cuda.empty_cache()
+            with seed_spans.span("pshuman: diffusion pipeline to CPU for the mv callback"):
+                try:
+                    pipeline.to("cpu")
+                except Exception as exc:  # noqa: BLE001 - only memory is at stake
+                    print(f"[mv-callback] pipeline stays on {home}: {type(exc).__name__}: {exc}", flush=True)
+                torch.cuda.empty_cache()
             # fails open: a host without the callback's models (Sapiens2, Z-Image) carves PSHuman's own views
             try:
                 colors, normals = _run_mv_callback(callback, save_dir, scene, MV_VIEWS, colors, normals)
             except Exception as exc:  # noqa: BLE001
                 print(f"[mv-callback] scene={scene}  FAILED ({type(exc).__name__}: {exc}); carving PSHuman's own views", flush=True)
             finally:
-                pipeline.to(home)
+                with seed_spans.span("pshuman: diffusion pipeline back to GPU after the mv callback"):
+                    pipeline.to(home)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
         _soma_views_prior(save_dir, scene, MV_VIEWS, colors, normals, pipeline)
         pose = econdata.__getitem__(case_id)
         with seed_spans.span("pshuman: reconstruct (SMPL fit + mesh)"):
