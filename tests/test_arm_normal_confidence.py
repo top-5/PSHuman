@@ -28,3 +28,11 @@ def test_confidence_dilates_and_respects_visible_alpha():
  result=normal_confidence(Renderer(),v,f,state,alpha,dilation=1)
  assert result[0,2,2,0] == 0 and result[0,1,2,0] == 0
  assert result[0,1,1,0] == 1 and result[0,0,0,0] == 1
+
+def test_outer_compaction_mapping_and_wrong_topology(tmp_path):
+ from utils.arm_normal_confidence import remap_weights
+ p=tmp_path/'full.npz';full=np.array([[0,1,2],[3,4,5]],np.int64);np.savez(p,faces_sha256=topology_digest(full),vertex_count=6,vertex_ids=np.array([1,4]))
+ np.testing.assert_array_equal(remap_weights(p,full,6,np.array([0,1,2]),np.array([[0,1,2]])),[0,1,0])
+ with pytest.raises(ValueError):remap_weights(p,full,6,np.array([0,1,2]),np.array([[0,2,1]]))
+ with pytest.raises(ValueError):remap_weights(p,full,6,np.array([0,1,2]),np.array([[0,1,2],[0,1,2]]))
+ with pytest.raises(ValueError):remap_weights(p,np.array([[0,2,1],[3,4,5]]),6,np.array([0,1,2]),np.array([[0,1,2]]))

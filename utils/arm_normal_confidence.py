@@ -61,3 +61,23 @@ def normal_confidence(renderer, vertices, faces, state, alpha, dilation=8, thres
             active = F.max_pool2d(active.float().permute(0,3,1,2),2*dilation+1,stride=1,padding=dilation).permute(0,2,3,1) > .5
             active &= alpha.detach() > .5
         return (~active).to(alpha.dtype)
+
+
+def remap_weights(path, source_faces, source_vertex_count, kept_ids, compact_faces):
+    """Map an exact source-topology binding through an indexed outer-surface compaction."""
+    source = np.asarray(source_faces)
+    kept = np.asarray(kept_ids)
+    compact = np.asarray(compact_faces)
+    if kept.ndim != 1 or not np.issubdtype(kept.dtype,np.integer) or not len(kept) or kept.min() < 0 or kept.max() >= source_vertex_count or not np.all(kept[1:] > kept[:-1]):
+        raise ValueError('invalid kept vertex mapping')
+    weights = load_weights(path, source, source_vertex_count)
+    remap = np.full(source_vertex_count,-1,dtype=np.int64)
+    remap[kept] = np.arange(len(kept))
+    mapped = remap[source]
+    mapped = mapped[(mapped >= 0).all(axis=1)]
+    if not np.array_equal(mapped, compact):
+        raise ValueError('compacted topology does not match kept vertex mapping')
+    result = weights[kept]
+    if not np.any(result > 0):
+        raise ValueError('no bound arm vertices survived compaction')
+    return result

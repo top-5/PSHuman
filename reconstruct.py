@@ -2310,10 +2310,12 @@ class ReMesh:
             target_normals = target_normals_original
 
         if body_prior is not None and "carve_vertices" in body_prior:
-            carve_v, carve_f, _ = _outer_surface(body_prior["carve_vertices"], body_prior["carve_faces"])
+            outer_v, outer_f = body_prior["carve_vertices"], body_prior["carve_faces"]
+            carve_v, carve_f, outer_ids = _outer_surface(outer_v, outer_f)
             print(f"[carve] start: seed's carve surface from the SOMA prior ({int(carve_v.shape[0])} vertices)", flush=True)
         else:
-            carve_v, carve_f, _ = _outer_surface(v_smpl.detach(), body_face.detach())
+            outer_v, outer_f = v_smpl.detach(), body_face.detach()
+            carve_v, carve_f, outer_ids = _outer_surface(outer_v, outer_f)
         print(f"[carve] start: the {'SOMA' if body_model == 'soma' else 'SMPL-X'} outer surface, {int(carve_v.shape[0])} of {int(v_smpl.shape[0])} vertices "
               "(eyeballs dropped)", flush=True)
         nrm_opt = MeshOptimizer(carve_v, carve_f, edge_len_lims=[0.01, 0.1])
@@ -2393,10 +2395,10 @@ class ReMesh:
         arm_normal_binding = os.environ.get("PSHUMAN_ARM_NORMAL_CONFIDENCE_NPZ", "").strip()
         arm_normal_enabled = bool(arm_normal_binding)
         if arm_normal_enabled:
-            from utils.arm_normal_confidence import attach, load_weights
-            arm_weights = load_weights(
-                arm_normal_binding, nrm_opt.faces.detach().cpu().numpy(),
-                int(nrm_opt.vertices.shape[0]),
+            from utils.arm_normal_confidence import attach, remap_weights
+            arm_weights = remap_weights(
+                arm_normal_binding, outer_f.detach().cpu().numpy(), int(outer_v.shape[0]),
+                outer_ids.detach().cpu().numpy(), nrm_opt.faces.detach().cpu().numpy(),
             )
             attach(nrm_opt, arm_weights)
         vertices, faces = nrm_opt.vertices, nrm_opt.faces
