@@ -30,10 +30,13 @@ def test_manifest_pins_every_view_and_camera(tmp_path):
     with pytest.raises(ValueError,match='hash mismatch'): driver.validate_manifest(m)
 
 
-def test_texture_only_output_retains_baseline_and_rejects_reuse(tmp_path,monkeypatch):
+@pytest.mark.parametrize('mode,budget,expected', [('default','ignored',None), ('all_faces','123456',123456)])
+def test_texture_only_output_retains_baseline_and_rejects_reuse(tmp_path,monkeypatch,mode,budget,expected):
     import torch
     from utils import project_mesh
     p,m=fixture(tmp_path)
+    monkeypatch.setenv('PSHUMAN_TEXTURE_RASTER_MODE',mode)
+    monkeypatch.setenv('PSHUMAN_TEXTURE_BIN_BUFFER_MAX_BYTES',budget)
     monkeypatch.setattr(project_mesh,'get_cameras_list',lambda *a,**kw: [None]*6)
     def project(mesh,*a,support_counts_out,**kw):
         assert kw['min_source_support']==.95
@@ -43,6 +46,7 @@ def test_texture_only_output_retains_baseline_and_rejects_reuse(tmp_path,monkeyp
     output=tmp_path/'out'
     report=driver.run(p,driver.digest(p),output,device='cpu',resolution=9)
     assert report['measured_vertices']==0 and report['baseline_vertices']==3
+    assert report['source_raster']=={'mode':mode,'bin_buffer_limit_bytes':expected}
     assert np.array_equal(driver.load_mesh(output/'texture-only.ply').visual.vertex_colors[:,:3],np.array([[10,20,30],[40,50,60],[70,80,90]],np.uint8))
     with pytest.raises(FileExistsError): driver.run(p,driver.digest(p),output,device='cpu',resolution=9)
 
@@ -67,5 +71,21 @@ def test_nonrepresentable_geometry_rejected_before_projection(tmp_path):
     m['mesh']={'path':str(obj),'sha256':driver.digest(obj)}
     p.write_text(json.dumps(m))
     with pytest.raises(ValueError,match='round-trip exactly'):
+        driver.run(p,driver.digest(p),tmp_path/'out',device='cpu',resolution=9)
+    assert not (tmp_path/'out').exists()
+
+
+def test_raster_policy_change_during_projection_refuses_output(tmp_path,monkeypatch):
+    import torch
+    from utils import project_mesh
+    p,_=fixture(tmp_path)
+    monkeypatch.setenv('PSHUMAN_TEXTURE_RASTER_MODE','default')
+    monkeypatch.setattr(project_mesh,'get_cameras_list',lambda *a,**kw: [None]*6)
+    def project(mesh,*a,support_counts_out,**kw):
+        support_counts_out['measured_mask']=torch.tensor([False,False,False])
+        monkeypatch.setenv('PSHUMAN_TEXTURE_RASTER_MODE','all_faces')
+        return mesh
+    monkeypatch.setattr(project_mesh,'multiview_color_projection',project)
+    with pytest.raises(RuntimeError,match='raster policy changed'):
         driver.run(p,driver.digest(p),tmp_path/'out',device='cpu',resolution=9)
     assert not (tmp_path/'out').exists()

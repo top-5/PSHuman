@@ -6,6 +6,7 @@ identity, not that the declared cross-view registration is physically correct.
 import argparse
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -79,7 +80,9 @@ def run(manifest_path, manifest_sha256, output, *, min_source_support=.95, resol
     from utils.project_mesh import get_cameras_list, multiview_color_projection
     from utils.source_color_sampling import validate_baseline_colors
     from utils.source_color_support import load_support, masked_images
+    from utils.texture_raster_budget import source_raster_policy
 
+    raster_policy = source_raster_policy(os.environ)
     started = time.perf_counter()
     if Path(output).exists():
         raise FileExistsError(f"output already exists: {output}")
@@ -131,6 +134,8 @@ def run(manifest_path, manifest_sha256, output, *, min_source_support=.95, resol
     rgb = np.clip(np.rint(projected * 255), 0, 255).astype(np.uint8)
     if not np.array_equal(rgb[~mask], baseline_colors[~mask]):
         raise RuntimeError('unsupported baseline colors changed')
+    if source_raster_policy(os.environ) != raster_policy:
+        raise RuntimeError("source raster policy changed during projection")
     output = Path(output); output.mkdir(parents=True, exist_ok=False)
     result_mesh = trimesh.Trimesh(vertices=verts_np, faces=faces_np, vertex_colors=rgb, process=False)
     for name, kind in [('texture-only.ply','ply'), ('texture-only.glb','glb')]:
@@ -139,7 +144,7 @@ def run(manifest_path, manifest_sha256, output, *, min_source_support=.95, resol
     report = {'schema':'pshuman.texture-only-result/1', 'manifest_sha256':manifest_sha256,
         'baseline_sha256':digest(inputs['baseline']), 'measured_vertices':int(mask.sum()),
         'baseline_vertices':int((~mask).sum()), 'inferred_fallback_vertices':0,
-        'min_source_support':min_source_support, 'resolution':resolution, 'geometry_precision':'float32 projection and export',
+        'min_source_support':min_source_support, 'resolution':resolution, 'source_raster':raster_policy, 'geometry_precision':'float32 projection and export',
         'projection_seconds':projection_seconds, 'wall_seconds':time.perf_counter()-started,
         'outputs':{n:digest(output/n) for n in ('texture-only.ply','texture-only.glb','measured-vertex-mask.npy')},
         'limitations':'Vertex colors only; no UV/material preservation. Declared shared-frame registration is not validated. Unknown source stays baseline; inferred views are not used.'}
