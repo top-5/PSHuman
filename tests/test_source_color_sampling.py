@@ -83,7 +83,10 @@ def test_baseline_requires_exact_geometry_and_finite_colors():
     baseline['faces']=torch.tensor([[0,2,1]])
     with pytest.raises(ValueError,match='exactly match'):
         validate_baseline_colors(vertices,faces,baseline)
-    baseline['faces']=faces.clone(); baseline['colors'][0,0]=float('nan')
+    baseline['faces']=faces.clone(); baseline['colors']=colors.double()
+    with pytest.raises(ValueError,match='dtype'):
+        validate_baseline_colors(vertices,faces,baseline)
+    baseline['colors']=colors.clone(); baseline['colors'][0,0]=float('nan')
     with pytest.raises(ValueError,match='finite RGB'):
         validate_baseline_colors(vertices,faces,baseline)
 
@@ -104,10 +107,13 @@ def test_real_multiview_projection_preserves_baseline_for_unsupported_and_hidden
     image=torch.zeros((4,9,9)); image[:3,4,4]=torch.tensor([.9,.3,.1]); image[3,4,4]=1
     silhouette=torch.ones_like(image)
     monkeypatch.setattr(project_mesh,'get_visibility_buffers',lambda *a,**kw:{'pix_to_face':torch.zeros((1,9,9),dtype=torch.long),'zbuf':torch.ones((1,9,9))})
-    def run(image):
-        return project_mesh.multiview_color_projection(mesh,[image,image],cameras_list=[Camera(),Camera()],weights=[1.,1.],device='cpu',resolution=9,support_silhouettes=[silhouette,silhouette],alpha_erode_px=4,depth_edge_tol=0.,below_confidence_strategy='original').textures.verts_features_packed()
+    def run(image,min_source_support=0.):
+        return project_mesh.multiview_color_projection(mesh,[image,image],cameras_list=[Camera(),Camera()],weights=[1.,1.],device='cpu',resolution=9,support_silhouettes=[silhouette,silhouette],alpha_erode_px=4,depth_edge_tol=0.,below_confidence_strategy='original',min_source_support=min_source_support).textures.verts_features_packed()
     result=run(image)
     torch.testing.assert_close(result,torch.tensor([[.9,.3,.1]]).expand(3,3),atol=1e-5,rtol=0)
+    partial=image.clone(); partial[3,4,4]=.5
+    assert torch.equal(run(partial,min_source_support=.95),colors)
+    assert not torch.equal(run(partial,min_source_support=.4),colors)
     absent=image.clone(); absent[3]=0
     torch.testing.assert_close(run(absent),colors)
     monkeypatch.setattr(project_mesh,'get_visibility_buffers',lambda *a,**kw:{'pix_to_face':torch.zeros((1,9,9),dtype=torch.long),'zbuf':torch.zeros((1,9,9))})

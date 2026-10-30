@@ -1091,7 +1091,9 @@ class ReMesh:
     
     @seed_spans.profile_stage('texture projection')
     def proj_texture(self, fused_images, vertices, faces, normal_images=None, fallback_images=None, source_only=False,
-                     support_silhouettes=None, baseline_mesh_colors=None):
+                     support_silhouettes=None, baseline_mesh_colors=None, baseline_min_source_support=0.95):
+        # For a baseline only, require near-complete interpolated measured alpha
+        # before an individual view may replace it; callers can adjust [0, 1].
         if baseline_mesh_colors is not None and not source_only:
             raise ValueError("baseline colors require source-only projection")
         if source_only and support_silhouettes is None:
@@ -1154,6 +1156,7 @@ class ReMesh:
             side_occlusion_indices=side_occlusion_indices,
             side_occlusion_guard=side_occlusion_guard,
             support_silhouettes=support_silhouettes,
+            min_source_support=baseline_min_source_support if baseline_mesh_colors is not None else 0.0,
         )
         if fallback_images is not None and baseline_mesh_colors is None:
             mesh = project(mesh, fallback_images)

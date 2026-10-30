@@ -404,6 +404,7 @@ def multiview_color_projection(
     side_occlusion_indices=None,
     side_occlusion_guard=True,
     support_silhouettes=None,
+    min_source_support=0.0,
 ) -> Meshes:
     """
     Projects color from a given image onto a 3D mesh.
@@ -425,6 +426,12 @@ def multiview_color_projection(
     Returns:
         Meshes: the colored mesh
     """
+    # Source support is interpolated alpha, independent of angle/depth gates.
+    # A zero default retains legacy behavior.
+    if isinstance(min_source_support, bool) or not isinstance(min_source_support, (int, float)) or not 0 <= min_source_support <= 1:
+        raise ValueError("min_source_support must be between 0 and 1")
+    if min_source_support > 0 and not use_alpha:
+        raise ValueError("min_source_support requires alpha")
     # 1. preprocess inputs
     if image_list is None:
         raise ValueError("image_list is None")
@@ -509,6 +516,8 @@ def multiview_color_projection(
             weight = (ret['cos_angles'].abs() ** 2 * weight)[:, None]
         if use_alpha:
             weight = weight * ret['valid_alpha']
+            if min_source_support > 0:
+                weight = weight * (ret['valid_alpha'] >= min_source_support)
         if normal_image is not None:
             normal_gate = ret["normal_gate"]
             gated_samples += int((normal_gate <= 0.05).sum().detach().cpu())

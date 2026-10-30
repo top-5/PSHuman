@@ -47,6 +47,6 @@ def validate_baseline_colors(vertices, faces, baseline):
         raise ValueError("baseline arrays must be tensors")
     if bv.dtype != vertices.dtype or bf.dtype != faces.dtype or not torch.equal(bv.to(vertices.device), vertices) or not torch.equal(bf.to(faces.device), faces):
         raise ValueError("baseline geometry and topology must exactly match the mesh")
-    if colors.shape != vertices.shape or not colors.is_floating_point() or not torch.isfinite(colors).all() or (colors < 0).any() or (colors > 1).any():
-        raise ValueError("baseline colors must be finite RGB values in [0, 1]")
-    return colors.to(device=vertices.device, dtype=vertices.dtype).clone()
+    if colors.shape != vertices.shape or colors.dtype != vertices.dtype or not colors.is_floating_point() or not torch.isfinite(colors).all() or (colors < 0).any() or (colors > 1).any():
+        raise ValueError("baseline colors must match vertex dtype and be finite RGB values in [0, 1]")
+    return colors.to(device=vertices.device).clone()
