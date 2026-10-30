@@ -2120,6 +2120,20 @@ class _PoissonStageCapture:
         temporary.write_text(json.dumps(self.manifest, indent=2) + "\n")
         os.replace(temporary, destination)
 
+    def record_input(self, points, normals):
+        path = self.directory / "poisson-input.npz"
+        point_array = np.ascontiguousarray(points)
+        normal_array = np.ascontiguousarray(normals)
+        np.savez_compressed(path, points=point_array, normals=normal_array)
+        self.manifest["poisson_input"] = {
+            "file": path.name, "sha256": self._hashlib.sha256(path.read_bytes()).hexdigest(),
+            "point_count": int(len(point_array)),
+            "points_sha256": self._hashlib.sha256(point_array.tobytes()).hexdigest(),
+            "normals_sha256": self._hashlib.sha256(normal_array.tobytes()).hexdigest(),
+            "points_dtype": str(point_array.dtype), "normals_dtype": str(normal_array.dtype),
+        }
+        self._write()
+
     def record(self, stage, mesh):
         path = self.directory / (stage + ".ply")
         mesh.export(path)
@@ -2146,11 +2160,13 @@ def poisson(mesh, obj_path, depth=10, decimation=True, front_mask=None, ortho_sc
         folds = _fold_safe_normals(mesh)
         print(f"[poisson] fold-safe normals: {folds} fold faces had their vertices' normals smoothed", flush=True)
     arm_joins = None
+    front_rebuild_used = False
     if front_mask is not None and ortho_scale is not None and os.environ.get(
         "PSHUMAN_ARM_FRONTAL_REBUILD", "1"
     ).strip().lower() not in {"0", "false", "no", "off"}:
         # Arms are re-attached and their tissue rebuilt from the FRONT silhouette before the
         # single Poisson; see `rebuild_arms_from_front_mask`.
+        front_rebuild_used = True
         points, normals, report = rebuild_arms_from_front_mask(mesh, front_mask, ortho_scale)
         arm_joins = report.pop("_join_points")
         if report_path:
@@ -2158,11 +2174,15 @@ def poisson(mesh, obj_path, depth=10, decimation=True, front_mask=None, ortho_sc
 
             with open(report_path, "w") as fh:
                 _json.dump(report, fh, indent=2)
+        if capture is not None:
+            capture.record_input(points, normals)
         raw_mesh = _poisson_points(points, normals, depth)
     else:
         pcd_path = obj_path[:-4] + "_soups.ply"
         mesh.export(pcd_path)
         pcl = o3d.io.read_point_cloud(pcd_path)
+        if capture is not None:
+            capture.record_input(np.asarray(pcl.points), np.asarray(pcl.normals))
         with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error) as cm:
             mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
                 pcl, depth=depth, n_threads=6
@@ -2170,7 +2190,8 @@ def poisson(mesh, obj_path, depth=10, decimation=True, front_mask=None, ortho_sc
         os.remove(pcd_path)
         raw_mesh = trimesh.Trimesh(np.array(mesh.vertices), np.array(mesh.triangles), process=False)
     if capture is not None:
-        capture.manifest["front_rebuild_used"] = arm_joins is not None
+        capture.manifest["front_rebuild_used"] = front_rebuild_used
+        capture.manifest["arm_join_points_present"] = arm_joins is not None and len(arm_joins) > 0
         capture.record("raw-before-attract", raw_mesh)
     # Permanently disabled in this fork.
     #

@@ -62,6 +62,11 @@ def test_stages_capture_same_raw_before_mutation_and_unique_runs(monkeypatch, tm
     for directory in dirs:
         report = json.loads((directory / 'manifest.json').read_text())
         assert report['status'] == 'complete'
+        assert report['front_rebuild_used'] is True
+        assert report['arm_join_points_present'] is False
+        packet = directory / report['poisson_input']['file']
+        assert hashlib.sha256(packet.read_bytes()).hexdigest() == report['poisson_input']['sha256']
+        assert np.array_equal(np.load(packet)['points'], np.zeros((1, 3)))
         assert [s['stage'] for s in report['stages']] == ['raw-before-attract', 'post-attract-before-filter', 'selected-output']
         for s in report['stages']:
             assert hashlib.sha256((directory / s['file']).read_bytes()).hexdigest() == s['sha256']
@@ -83,3 +88,32 @@ def test_no_attraction_snapshots_same_raw(monkeypatch, tmp_path):
     assert report['attract'] == '0'
     assert report['stages'][0]['sha256'] == report['stages'][1]['sha256']
     assert np.array_equal(result.vertices, original.vertices)
+
+
+def test_no_front_records_exact_point_cloud_passed_to_poisson(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    ns, events, original = setup_namespace(monkeypatch, tmp_path / 'captures')
+    monkeypatch.setenv('PSHUMAN_POISSON_ATTRACT_PARTS', '0')
+    points = np.asarray(original.vertices).copy()
+    normals = np.asarray(original.vertex_normals).copy()
+    pcl = SimpleNamespace(points=points, normals=normals)
+    class Context:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+    observed = []
+    def solve(passed, depth, n_threads):
+        observed.append(passed)
+        return SimpleNamespace(vertices=original.vertices, triangles=original.faces), None
+    ns['o3d'] = SimpleNamespace(
+        io=SimpleNamespace(read_point_cloud=lambda path: pcl),
+        utility=SimpleNamespace(VerbosityContextManager=lambda level: Context(), VerbosityLevel=SimpleNamespace(Error=0)),
+        geometry=SimpleNamespace(TriangleMesh=SimpleNamespace(create_from_point_cloud_poisson=solve)))
+    ns['trimesh'] = trimesh
+    ns['poisson'](original.copy(), str(tmp_path / 'input.obj'), decimation=False)
+    assert observed == [pcl]
+    directory = next((tmp_path / 'captures').iterdir())
+    report = json.loads((directory / 'manifest.json').read_text())
+    assert report['front_rebuild_used'] is False
+    packet = np.load(directory / report['poisson_input']['file'])
+    assert np.array_equal(packet['points'], observed[0].points)
+    assert np.array_equal(packet['normals'], observed[0].normals)
