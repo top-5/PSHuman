@@ -1,6 +1,7 @@
 """Optional topology-bound attenuation of projected normal loss around arms."""
 import hashlib
 import io
+import os
 from pathlib import Path
 import numpy as np
 import torch
@@ -33,13 +34,26 @@ def _binding_count(value):
     return int(item.item())
 
 
-def verify_prior_binding(path, loaded_prior_sha256):
+def required_prior_binding(env=None):
+    """Explicitly require a same-run prior seal; external mode remains default."""
+    value = (os.environ if env is None else env).get(
+        'PSHUMAN_ARM_NORMAL_REQUIRE_PRIOR_BINDING', '0').strip().lower()
+    if value not in {'0', '1', 'false', 'true'}:
+        raise ValueError('invalid PSHUMAN_ARM_NORMAL_REQUIRE_PRIOR_BINDING')
+    return value in {'1', 'true'}
+
+
+def verify_prior_binding(path, loaded_prior_sha256, *, require_bound=False):
     """Check an optional declared prior hash against bytes actually loaded.
 
     External bindings without a prior hash are accepted as explicitly unbound.
     """
+    if type(require_bound) is not bool:
+        raise ValueError('require_bound must be a boolean')
     with np.load(io.BytesIO(path) if isinstance(path, bytes) else Path(path), allow_pickle=False) as data:
         if 'prior_sha256' not in data:
+            if require_bound:
+                raise ValueError('same-run binding requires prior_sha256')
             return {'status': 'external_unbound', 'loadedPriorSha256': loaded_prior_sha256}
         value = np.asarray(data['prior_sha256'])
         if value.shape != () or value.dtype.kind not in 'US':

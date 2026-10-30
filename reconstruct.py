@@ -91,7 +91,10 @@ def _load_smpl_prior_npz(path, device, dtype):
 # ---- optional SOMA body (PSHUMAN_BODY_MODEL=soma) ---------------------------------------------------------------
 # seed fits an NVIDIA SOMA body itself and hands it over already placed in THIS normalised camera frame (the frame of
 # `v_smpl`). PSHuman then skips its own SMPL-X fit and uses that body for the carve start and the hand/arm donors.
-SOMA_PRIOR_GROUPS = ("left_hand", "right_hand", "left_distal_arm", "right_distal_arm", "head")
+from utils.soma_prior import (
+    SOMA_PRIOR_GROUPS, load_soma_body_prior_npz as _load_soma_body_prior_npz,
+    outer_surface as _outer_surface, select_carve_start,
+)
 
 
 def _body_model_name():
@@ -101,53 +104,6 @@ def _body_model_name():
     return name
 
 
-def _load_soma_body_prior_npz(path, device):
-    """The fitted SOMA body: `vertices` (V,3) float, `faces` (F,3) int, and int vertex-id groups SOMA_PRIOR_GROUPS."""
-    path = str(path or "").strip()
-    if not path:
-        raise ValueError("PSHUMAN_BODY_MODEL=soma needs PSHUMAN_BODY_PRIOR_NPZ (the SOMA body fitted by seed)")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"PSHUMAN_BODY_PRIOR_NPZ does not exist: {path}")
-    loaded_prior_sha256 = None
-    if os.environ.get("PSHUMAN_ARM_NORMAL_CONFIDENCE_NPZ", "").strip():
-        import hashlib
-        import io
-        with open(path, "rb") as prior_stream:
-            prior_bytes = prior_stream.read()
-        loaded_prior_sha256 = hashlib.sha256(prior_bytes).hexdigest()
-        data = np.load(io.BytesIO(prior_bytes), allow_pickle=False)
-    else:
-        data = np.load(path, allow_pickle=False)
-    missing = [k for k in ("vertices", "faces") + SOMA_PRIOR_GROUPS if k not in data]
-    if missing:
-        raise KeyError(f"PSHUMAN_BODY_PRIOR_NPZ {path} lacks keys {missing} (has {sorted(data.files)})")
-    verts = np.asarray(data["vertices"], dtype=np.float32)
-    faces = np.asarray(data["faces"])
-    if verts.ndim != 2 or verts.shape[1] != 3 or verts.shape[0] == 0 or not np.isfinite(verts).all():
-        raise ValueError(f"PSHUMAN_BODY_PRIOR_NPZ {path}: `vertices` must be finite (V,3), got {verts.shape}")
-    if faces.ndim != 2 or faces.shape[1] != 3 or faces.shape[0] == 0 or not np.issubdtype(faces.dtype, np.integer):
-        raise ValueError(f"PSHUMAN_BODY_PRIOR_NPZ {path}: `faces` must be integer (F,3), got {faces.dtype} {faces.shape}")
-    n = verts.shape[0]
-    if faces.min() < 0 or faces.max() >= n:
-        raise ValueError(f"PSHUMAN_BODY_PRIOR_NPZ {path}: `faces` index outside 0..{n - 1}")
-    out = {
-        "path": path,
-        "vertices": torch.as_tensor(verts, device=device),
-        "faces": torch.as_tensor(faces.astype(np.int64), device=device),
-    }
-    if loaded_prior_sha256 is not None:
-        out["loaded_sha256"] = loaded_prior_sha256
-    # optional: the surface the carve starts from, when seed gives one (a closed, evenly meshed shell of the same
-    # body: SOMA's own face has parted lips over an inner mouth, and the carve grew needles from it)
-    if "carve_vertices" in data and "carve_faces" in data:
-        out["carve_vertices"] = torch.as_tensor(np.asarray(data["carve_vertices"], dtype=np.float32), device=device)
-        out["carve_faces"] = torch.as_tensor(np.asarray(data["carve_faces"]).astype(np.int64), device=device)
-    for key in SOMA_PRIOR_GROUPS:
-        ids = np.asarray(data[key]).reshape(-1)
-        if ids.size == 0 or not np.issubdtype(ids.dtype, np.integer) or ids.min() < 0 or ids.max() >= n:
-            raise ValueError(f"PSHUMAN_BODY_PRIOR_NPZ {path}: group `{key}` must be non-empty int ids in 0..{n - 1}")
-        out[key] = ids.astype(np.int64)
-    return out
 
 
 def _soma_vertex_mask(body_prior, groups):
@@ -167,28 +123,6 @@ def _soma_hands_visibility(pose):
     return vis
 
 
-def _outer_surface(vertices, faces):
-    """The largest face-connected piece of a mesh, compacted: the SMPL-X body without its two eyeballs (separate
-    546-vertex spheres in the eye sockets). Carved from with them, the remesher folded each eyeball into the eyelids
-    and left a crumpled patch on both eyes (alena-bikini, 2026-10-05). Returns (vertices, faces, kept vertex ids)."""
-    import scipy.sparse as sp
-    from scipy.sparse.csgraph import connected_components
-
-    f = faces.detach().cpu().numpy()
-    n = int(vertices.shape[0])
-    e = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]])
-    graph = sp.coo_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])), shape=(n, n))
-    _, label = connected_components(graph, directed=False)
-    used = np.zeros(n, bool)
-    used[f.ravel()] = True
-    counts = np.bincount(label[used], minlength=label.max() + 1)
-    keep = (label == int(np.argmax(counts))) & used
-    remap = -np.ones(n, np.int64)
-    remap[keep] = np.arange(int(keep.sum()))
-    f_keep = remap[f]
-    f_keep = f_keep[(f_keep >= 0).all(axis=1)]
-    ids = torch.as_tensor(np.flatnonzero(keep), device=vertices.device)
-    return vertices.index_select(0, ids), torch.as_tensor(f_keep, device=faces.device, dtype=faces.dtype), ids
 
 
 def _placement_from_vertices(v_raw, v_target):
@@ -2320,13 +2254,11 @@ class ReMesh:
             masks = masks_original
             target_normals = target_normals_original
 
+        outer_v, outer_f, carve_v, carve_f, outer_ids = select_carve_start(
+            body_prior, v_smpl.detach(), body_face.detach(),
+        )
         if body_prior is not None and "carve_vertices" in body_prior:
-            outer_v, outer_f = body_prior["carve_vertices"], body_prior["carve_faces"]
-            carve_v, carve_f, outer_ids = _outer_surface(outer_v, outer_f)
             print(f"[carve] start: seed's carve surface from the SOMA prior ({int(carve_v.shape[0])} vertices)", flush=True)
-        else:
-            outer_v, outer_f = v_smpl.detach(), body_face.detach()
-            carve_v, carve_f, outer_ids = _outer_surface(outer_v, outer_f)
         print(f"[carve] start: the {'SOMA' if body_model == 'soma' else 'SMPL-X'} outer surface, {int(carve_v.shape[0])} of {int(v_smpl.shape[0])} vertices "
               "(eyeballs dropped)", flush=True)
         nrm_opt = MeshOptimizer(carve_v, carve_f, edge_len_lims=[0.01, 0.1])
@@ -2408,11 +2340,14 @@ class ReMesh:
         if arm_normal_enabled:
             import hashlib
             import utils.arm_normal_confidence as arm_confidence_module
-            from utils.arm_normal_confidence import attach, remap_weights, remap_known_non_arm, verify_prior_binding
+            from utils.arm_normal_confidence import (
+                attach, remap_weights, remap_known_non_arm, verify_prior_binding, required_prior_binding,
+            )
             with open(arm_normal_binding, "rb") as binding_stream:
                 arm_binding_bytes = binding_stream.read()
             prior_binding = verify_prior_binding(
                 arm_binding_bytes, body_prior.get("loaded_sha256") if body_prior is not None else None,
+                require_bound=required_prior_binding(),
             )
             arm_attenuation = float(os.environ.get("PSHUMAN_ARM_NORMAL_ATTENUATION", "0"))
             arm_dilation = int(os.environ.get("PSHUMAN_ARM_NORMAL_DILATION", "8"))
