@@ -2388,6 +2388,17 @@ class ReMesh:
                 f"target_arm_half_depth={slab_target_arm_half_depth:.4f} w={slab_arm_depth_w}",
                 flush=True,
             )
+        # Optional, explicitly topology-bound arm-normal confidence. The
+        # weights travel in the remesher state; no source pixels are modified.
+        arm_normal_binding = os.environ.get("PSHUMAN_ARM_NORMAL_CONFIDENCE_NPZ", "").strip()
+        arm_normal_enabled = bool(arm_normal_binding)
+        if arm_normal_enabled:
+            from utils.arm_normal_confidence import attach, load_weights
+            arm_weights = load_weights(
+                arm_normal_binding, nrm_opt.faces.detach().cpu().numpy(),
+                int(nrm_opt.vertices.shape[0]),
+            )
+            attach(nrm_opt, arm_weights)
         vertices, faces = nrm_opt.vertices, nrm_opt.faces
 
         # ---- synthetic acceptance check for cross-view depth loss ------------
@@ -2439,7 +2450,15 @@ class ReMesh:
             nrm = self.renderer.render(vertices,faces, normals=normals)
             normals = nrm[..., :3]   
             # if i < 800:
-            loss = ((normals-target_normals) * self.weights).abs().mean()
+            if arm_normal_enabled:
+                from utils.arm_normal_confidence import normal_confidence
+                confidence = normal_confidence(
+                    self.renderer, vertices, faces, nrm_opt._vertices_etc,
+                    nrm[..., 3:], dilation=8,
+                )
+                loss = ((normals-target_normals) * self.weights * confidence).abs().mean()
+            else:
+                loss = ((normals-target_normals) * self.weights).abs().mean()
             # else:
             #     loss = ((normals-target_images) * masks).abs().mean()
             
