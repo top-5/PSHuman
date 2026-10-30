@@ -89,3 +89,24 @@ def test_capture_loaded_initial_state_is_exact_and_exclusive(tmp_path):
  with np.load(path,allow_pickle=False) as saved:np.testing.assert_array_equal(saved['normal_target'],tensor.numpy())
  assert receipt['arrays']['normal_target']['shape']==[3,2]
  with pytest.raises(FileExistsError):capture_initial_state(path,normal_target=tensor)
+
+def test_prior_hash_prevents_swapped_same_topology_prior(tmp_path):
+ import hashlib
+ from utils.arm_normal_confidence import verify_prior_binding
+ a=tmp_path/'a.npz';b=tmp_path/'b.npz';binding=tmp_path/'binding.npz'
+ np.savez(a,vertices=np.zeros((3,3)),faces=FACES)
+ np.savez(b,vertices=np.ones((3,3)),faces=FACES)
+ hash_a=hashlib.sha256(a.read_bytes()).hexdigest();hash_b=hashlib.sha256(b.read_bytes()).hexdigest()
+ np.savez(binding,faces_sha256=topology_digest(FACES),vertex_count=3,vertex_ids=np.array([0]),prior_sha256=hash_a)
+ assert verify_prior_binding(binding.read_bytes(),hash_a)['status']=='matched'
+ with pytest.raises(ValueError,match='does not match'):verify_prior_binding(binding.read_bytes(),hash_b)
+ with pytest.raises(ValueError,match='no SOMA prior'):verify_prior_binding(binding.read_bytes(),None)
+ np.savez(binding,faces_sha256=topology_digest(FACES),vertex_count=3,vertex_ids=np.array([0]))
+ assert verify_prior_binding(binding.read_bytes(),hash_b)['status']=='external_unbound'
+ assert verify_prior_binding(binding.read_bytes(),None)['status']=='external_unbound'
+
+@pytest.mark.parametrize('invalid',[3.0, True, 'x'*64, np.array(['a'*64])])
+def test_prior_hash_rejects_malformed(tmp_path,invalid):
+ from utils.arm_normal_confidence import verify_prior_binding
+ p=tmp_path/'binding.npz';np.savez(p,prior_sha256=invalid)
+ with pytest.raises(ValueError):verify_prior_binding(p,'a'*64)

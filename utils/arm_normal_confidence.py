@@ -1,5 +1,6 @@
 """Optional topology-bound attenuation of projected normal loss around arms."""
 import hashlib
+import io
 from pathlib import Path
 import numpy as np
 import torch
@@ -32,6 +33,32 @@ def _binding_count(value):
     return int(item.item())
 
 
+def verify_prior_binding(path, loaded_prior_sha256):
+    """Check an optional declared prior hash against bytes actually loaded.
+
+    External bindings without a prior hash are accepted as explicitly unbound.
+    """
+    with np.load(io.BytesIO(path) if isinstance(path, bytes) else Path(path), allow_pickle=False) as data:
+        if 'prior_sha256' not in data:
+            return {'status': 'external_unbound', 'loadedPriorSha256': loaded_prior_sha256}
+        value = np.asarray(data['prior_sha256'])
+        if value.shape != () or value.dtype.kind not in 'US':
+            raise ValueError('binding prior_sha256 must be a scalar string')
+        declared = value.item()
+        if isinstance(declared, bytes):
+            try:
+                declared = declared.decode('ascii')
+            except UnicodeDecodeError as exc:
+                raise ValueError('invalid binding prior_sha256') from exc
+        if len(declared) != 64 or any(c not in '0123456789abcdef' for c in declared):
+            raise ValueError('invalid binding prior_sha256')
+        if loaded_prior_sha256 is None:
+            raise ValueError('binding declares prior_sha256 but no SOMA prior was loaded')
+        if declared != loaded_prior_sha256:
+            raise ValueError('binding prior_sha256 does not match loaded SOMA prior')
+        return {'status': 'matched', 'bindingPriorSha256': declared, 'loadedPriorSha256': loaded_prior_sha256}
+
+
 def load_weights(path, faces, vertex_count):
     if type(vertex_count) is not int or vertex_count <= 0:
         raise ValueError('vertex_count must be a positive integer')
@@ -39,7 +66,7 @@ def load_weights(path, faces, vertex_count):
     digest = topology_digest(a)
     if a.size == 0 or a.min() < 0 or a.max() >= vertex_count:
         raise ValueError('faces out of range')
-    with np.load(Path(path), allow_pickle=False) as d:
+    with np.load(io.BytesIO(path) if isinstance(path, bytes) else Path(path), allow_pickle=False) as d:
         if str(d['faces_sha256'].item()) != digest or _binding_count(d['vertex_count']) != vertex_count:
             raise ValueError('topology binding mismatch')
         if ('weights' in d) == ('vertex_ids' in d):
@@ -129,7 +156,7 @@ def remap_weights(path, source_faces, source_vertex_count, kept_ids, compact_fac
 
 def remap_known_non_arm(path, source_faces, source_vertex_count, kept_ids, arm_weights):
     """Return optional explicit non-arm vertex labels; never infer unknown labels."""
-    with np.load(Path(path), allow_pickle=False) as d:
+    with np.load(io.BytesIO(path) if isinstance(path, bytes) else Path(path), allow_pickle=False) as d:
         if str(d['faces_sha256'].item()) != topology_digest(source_faces) or _binding_count(d['vertex_count']) != source_vertex_count:
             raise ValueError('topology binding mismatch')
         if 'known_non_arm_ids' not in d:

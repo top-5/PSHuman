@@ -108,7 +108,16 @@ def _load_soma_body_prior_npz(path, device):
         raise ValueError("PSHUMAN_BODY_MODEL=soma needs PSHUMAN_BODY_PRIOR_NPZ (the SOMA body fitted by seed)")
     if not os.path.exists(path):
         raise FileNotFoundError(f"PSHUMAN_BODY_PRIOR_NPZ does not exist: {path}")
-    data = np.load(path, allow_pickle=False)
+    loaded_prior_sha256 = None
+    if os.environ.get("PSHUMAN_ARM_NORMAL_CONFIDENCE_NPZ", "").strip():
+        import hashlib
+        import io
+        with open(path, "rb") as prior_stream:
+            prior_bytes = prior_stream.read()
+        loaded_prior_sha256 = hashlib.sha256(prior_bytes).hexdigest()
+        data = np.load(io.BytesIO(prior_bytes), allow_pickle=False)
+    else:
+        data = np.load(path, allow_pickle=False)
     missing = [k for k in ("vertices", "faces") + SOMA_PRIOR_GROUPS if k not in data]
     if missing:
         raise KeyError(f"PSHUMAN_BODY_PRIOR_NPZ {path} lacks keys {missing} (has {sorted(data.files)})")
@@ -126,6 +135,8 @@ def _load_soma_body_prior_npz(path, device):
         "vertices": torch.as_tensor(verts, device=device),
         "faces": torch.as_tensor(faces.astype(np.int64), device=device),
     }
+    if loaded_prior_sha256 is not None:
+        out["loaded_sha256"] = loaded_prior_sha256
     # optional: the surface the carve starts from, when seed gives one (a closed, evenly meshed shell of the same
     # body: SOMA's own face has parted lips over an inner mouth, and the carve grew needles from it)
     if "carve_vertices" in data and "carve_faces" in data:
@@ -2397,23 +2408,29 @@ class ReMesh:
         if arm_normal_enabled:
             import hashlib
             import utils.arm_normal_confidence as arm_confidence_module
-            from utils.arm_normal_confidence import attach, remap_weights, remap_known_non_arm
+            from utils.arm_normal_confidence import attach, remap_weights, remap_known_non_arm, verify_prior_binding
+            with open(arm_normal_binding, "rb") as binding_stream:
+                arm_binding_bytes = binding_stream.read()
+            prior_binding = verify_prior_binding(
+                arm_binding_bytes, body_prior.get("loaded_sha256") if body_prior is not None else None,
+            )
             arm_attenuation = float(os.environ.get("PSHUMAN_ARM_NORMAL_ATTENUATION", "0"))
             arm_dilation = int(os.environ.get("PSHUMAN_ARM_NORMAL_DILATION", "8"))
             if not np.isfinite(arm_attenuation) or not 0 <= arm_attenuation <= 1 or not 0 <= arm_dilation <= 256:
                 raise ValueError("invalid arm-normal attenuation or dilation")
             arm_weights = remap_weights(
-                arm_normal_binding, outer_f.detach().cpu().numpy(), int(outer_v.shape[0]),
+                arm_binding_bytes, outer_f.detach().cpu().numpy(), int(outer_v.shape[0]),
                 outer_ids.detach().cpu().numpy(), nrm_opt.faces.detach().cpu().numpy(),
             )
             known_non_arm = remap_known_non_arm(
-                arm_normal_binding, outer_f.detach().cpu().numpy(), int(outer_v.shape[0]),
+                arm_binding_bytes, outer_f.detach().cpu().numpy(), int(outer_v.shape[0]),
                 outer_ids.detach().cpu().numpy(), arm_weights,
             )
             attach(nrm_opt, arm_weights, known_non_arm)
             _sha = lambda b: hashlib.sha256(b).hexdigest()
             arm_report = {
-                "bindingSha256": _sha(open(arm_normal_binding, "rb").read()),
+                "bindingSha256": _sha(arm_binding_bytes),
+                "priorBinding": prior_binding,
                 "reconstructSha256": _sha(open(__file__, "rb").read()),
                 "confidenceHelperSha256": _sha(open(arm_confidence_module.__file__, "rb").read()),
                 "loadedMaskSha256": _sha(masks.detach().cpu().contiguous().numpy().tobytes()),
