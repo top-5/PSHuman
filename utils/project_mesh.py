@@ -405,6 +405,7 @@ def multiview_color_projection(
     side_occlusion_guard=True,
     support_silhouettes=None,
     min_source_support=0.0,
+    support_counts_out=None,
 ) -> Meshes:
     """
     Projects color from a given image onto a 3D mesh.
@@ -535,6 +536,8 @@ def multiview_color_projection(
     # into the under-arm dress area. After source-side visibility/normal gates,
     # a low-weight sample is still better evidence than global mesh smoothing.
     observed = texture_counts > 1e-6
+    if support_counts_out is not None:
+        support_counts_out["measured_mask"] = observed[:, 0].detach().cpu().clone()
     texture_values = torch.where(
         observed,
         texture_values / texture_counts.clamp_min(1e-6),
