@@ -1109,6 +1109,17 @@ class ReMesh:
             raise ValueError("baseline colors require source-only projection")
         if source_only and support_silhouettes is None:
             raise ValueError("source-only projection requires original silhouette alpha")
+        source_raster_env = None
+        if source_only:
+            # Snapshot once for both fallback and measured passes. A transient
+            # environment change must not select another policy between views.
+            from types import MappingProxyType
+            from utils.texture_raster_budget import source_raster_policy
+            policy = source_raster_policy(os.environ)
+            frozen = {"PSHUMAN_TEXTURE_RASTER_MODE": policy["mode"]}
+            if policy["bin_buffer_limit_bytes"] is not None:
+                frozen["PSHUMAN_TEXTURE_BIN_BUFFER_MAX_BYTES"] = str(policy["bin_buffer_limit_bytes"])
+            source_raster_env = MappingProxyType(frozen)
         mesh = to_py3d_mesh(vertices, faces)
         mesh = mesh.to(self.device)
         camera_focal =  1/2
@@ -1168,6 +1179,7 @@ class ReMesh:
             side_occlusion_guard=side_occlusion_guard,
             support_silhouettes=support_silhouettes,
             min_source_support=baseline_min_source_support if baseline_mesh_colors is not None else 0.0,
+            source_raster_env=source_raster_env,
         )
         if fallback_images is not None and baseline_mesh_colors is None:
             mesh = project(mesh, fallback_images)
