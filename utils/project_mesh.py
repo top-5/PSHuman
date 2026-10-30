@@ -16,7 +16,7 @@ from pytorch3d.renderer import (
 )
 from pytorch3d.renderer import MeshRasterizer
 
-def render_pix2faces_py3d(meshes, cameras, H=512, W=512, blur_radius=0.0, faces_per_pixel=1):
+def render_pix2faces_py3d(meshes, cameras, H=512, W=512, blur_radius=0.0, faces_per_pixel=1, raster_options=None):
     """
     Renders pix2face of visible faces.
 
@@ -35,7 +35,8 @@ def render_pix2faces_py3d(meshes, cameras, H=512, W=512, blur_radius=0.0, faces_
     raster_settings = RasterizationSettings(
         image_size=(H, W),
         blur_radius=blur_radius,
-        faces_per_pixel=faces_per_pixel
+        faces_per_pixel=faces_per_pixel,
+        **(raster_options or {})
     )
     rasterizer=MeshRasterizer(
         cameras=cameras, 
@@ -101,8 +102,8 @@ def get_visible_faces(meshes: Meshes, cameras: CamerasBase, resolution=1024):
     unique_faces = unique_faces[unique_faces != -1]
     return unique_faces
 
-def get_visibility_buffers(meshes: Meshes, cameras: CamerasBase, resolution=1024):
-    return render_pix2faces_py3d(meshes, cameras, H=resolution, W=resolution)
+def get_visibility_buffers(meshes: Meshes, cameras: CamerasBase, resolution=1024, raster_options=None):
+    return render_pix2faces_py3d(meshes, cameras, H=resolution, W=resolution, raster_options=raster_options)
 
 def project_color(
     meshes: Meshes,
@@ -143,7 +144,14 @@ def project_color(
     meshes = meshes.to(device)
     cameras = cameras.to(device)
 
-    visibility = get_visibility_buffers(meshes, cameras, resolution=resolution)
+    raster_options = None
+    if support_silhouette is not None:
+        from utils.texture_raster_budget import source_raster_options
+        raster_options = source_raster_options(meshes, cameras, resolution, resolution, os.environ)
+    if raster_options is None:
+        visibility = get_visibility_buffers(meshes, cameras, resolution=resolution)
+    else:
+        visibility = get_visibility_buffers(meshes, cameras, resolution=resolution, raster_options=raster_options)
     pix_to_face = visibility["pix_to_face"]
     zbuf = visibility["zbuf"]
     unique_faces = torch.unique(pix_to_face.flatten())
