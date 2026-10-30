@@ -35,3 +35,18 @@ def sample_source_color(image, silhouette, points, *, alpha_erode_px=0, alpha_ed
                              padding_mode='zeros', mode='bilinear')[0, :, :, 0].T.clamp(0, 1)
         alpha = alpha * (safe >= float(alpha_edge_threshold)).to(alpha.dtype)
     return rgb, alpha
+
+
+def validate_baseline_colors(vertices, faces, baseline):
+    """Accept only colors explicitly bound to this exact indexed mesh."""
+    import torch
+    if not isinstance(baseline, dict) or set(baseline) != {"vertices", "faces", "colors"}:
+        raise ValueError("baseline must contain vertices, faces and colors")
+    bv, bf, colors = baseline["vertices"], baseline["faces"], baseline["colors"]
+    if not all(isinstance(v, torch.Tensor) for v in (bv, bf, colors)):
+        raise ValueError("baseline arrays must be tensors")
+    if bv.dtype != vertices.dtype or bf.dtype != faces.dtype or not torch.equal(bv.to(vertices.device), vertices) or not torch.equal(bf.to(faces.device), faces):
+        raise ValueError("baseline geometry and topology must exactly match the mesh")
+    if colors.shape != vertices.shape or colors.dtype != vertices.dtype or not colors.is_floating_point() or not torch.isfinite(colors).all() or (colors < 0).any() or (colors > 1).any():
+        raise ValueError("baseline colors must match vertex dtype and be finite RGB values in [0, 1]")
+    return colors.to(device=vertices.device).clone()
