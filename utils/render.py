@@ -1,79 +1,91 @@
-from matplotlib import image
-import nvdiffrast.torch as dr
+"""DRTK normal and world-coordinate buffers for PSHuman reconstruction.
+
+The existing GL clip matrices define output orientation (the sparse-camera
+builder already flips Y). DRTK supplies hard-forward visibility with its explicit
+edge-gradient estimator; this is not nvdiffrast's fractional antialias filter.
+"""
+
 import torch
 
-def _warmup(glctx, device):
-    #windows workaround for https://github.com/NVlabs/nvdiffrast/issues/59
- 
-    pos = torch.tensor([[[-0.8, -0.8, 0, 1], [0.8, -0.8, 0, 1], [-0.8, 0.8, 0, 1]]], dtype=torch.float32, device=device)
-    tri = torch.tensor([[0, 1, 2]], dtype=torch.int32, device=device)
-    dr.rasterize(glctx, pos, tri, resolution=[256, 256])
+from seed.render import drtk_ops
+
 
 class NormalsRenderer:
-    
-    _glctx:dr.RasterizeGLContext = None
-    
+    backend = "drtk"
+    coverage = "hard forward with DRTK visibility-boundary gradients"
+
     def __init__(
-            self,
-            mv: torch.Tensor, #C,4,4
-            proj: torch.Tensor, #C,4,4
-            image_size: tuple[int,int],
-            device: str
-            ):
-        self._mvp = proj @ mv #C,4,4
-        self._image_size = image_size
-        # self._glctx = dr.RasterizeGLContext()
-        self._glctx = dr.RasterizeCudaContext(device=device)
-        _warmup(self._glctx, device)
+        self,
+        mv: torch.Tensor,
+        proj: torch.Tensor,
+        image_size: tuple[int, int],
+        device: str,
+    ):
+        if len(image_size) != 2 or any(
+            int(value) != value or value <= 0 for value in image_size
+        ):
+            raise ValueError("image_size must contain positive height and width")
+        mv = torch.as_tensor(mv, dtype=torch.float32, device=device)
+        proj = torch.as_tensor(proj, dtype=torch.float32, device=device)
+        if mv.shape[-2:] != (4, 4) or proj.shape[-2:] != (4, 4):
+            raise ValueError("mv and proj must be batched 4x4 matrices")
+        if mv.ndim == 2:
+            mv = mv[None]
+        if proj.ndim == 2:
+            proj = proj[None]
+        last = proj[..., 3, :]
+        orthographic = torch.allclose(
+            last, last.new_tensor([0, 0, 0, 1]).expand_as(last)
+        )
+        perspective = bool(
+            (last[..., :2].abs() < 1e-7).all()
+            and (last[..., 2].abs() > 1e-7).all()
+            and (last[..., 3].abs() < 1e-7).all()
+        )
+        if not orthographic and not perspective:
+            raise NotImplementedError(
+                "DRTK renderer supports standard GL orthographic or perspective projections"
+            )
+        self._projection = "orthographic" if orthographic else "perspective"
+        self._mvp = proj @ mv
+        self._image_size = tuple(map(int, image_size))
+        self.runtime = drtk_ops.runtime_identity()
+        self._glctx = None  # compatibility only: DRTK creates no OpenGL context
 
-    def render(self,
-            vertices: torch.Tensor, #V,3 float
-            faces: torch.Tensor, #F,3 long
-            colors: torch.Tensor = None, #V,3 float
-            normals: torch.Tensor = None, #V,3 float
-            return_triangles: bool = False  
-            ) -> torch.Tensor: #C,H,W,4
+    def _raster(self, vertices, faces):
+        if vertices.ndim != 2 or vertices.shape[-1] != 3:
+            raise ValueError("vertices must be [V,3]")
+        homogeneous = torch.cat((vertices, torch.ones_like(vertices[:, :1])), -1)
+        clip = homogeneous @ self._mvp.transpose(-2, -1)
+        return drtk_ops.rasterize(
+            clip.contiguous(),
+            faces.to(torch.int32),
+            self._image_size,
+            projection=self._projection,
+        )
 
-        V = vertices.shape[0]
-        faces = faces.type(torch.int32)
-        vert_hom = torch.cat((vertices, torch.ones(V,1,device=vertices.device)),axis=-1) #V,3 -> V,4
-        vertices_clip = vert_hom @ self._mvp.transpose(-2,-1) #C,V,4
-        rast_out,_ = dr.rasterize(self._glctx, vertices_clip, faces, resolution=self._image_size, grad_db=False) #C,H,W,4
-        vert_nrm = (normals+1)/2 if normals is not None else colors
-        nrm, _ = dr.interpolate(vert_nrm, rast_out, faces) #C,H,W,3
-        alpha = torch.clamp(rast_out[..., -1:], max=1) #C,H,W,1
-        nrm = torch.concat((nrm,alpha),dim=-1) #C,H,W,4
-        nrm = dr.antialias(nrm, rast_out, vertices_clip, faces) #C,H,W,4
+    def render(
+        self, vertices, faces, colors=None, normals=None, return_triangles=False
+    ):
+        """Return [C,H,W,4] encoded normal/color and alpha buffers."""
+        attributes = (normals + 1) / 2 if normals is not None else colors
+        if attributes is None or attributes.shape != vertices.shape:
+            raise ValueError("normals or colors must be [V,3] matching vertices")
+        raster = self._raster(vertices, faces)
+        color = drtk_ops.interpolate(attributes[None].contiguous(), raster)
+        rgba = torch.cat((color, raster.valid[..., None].to(color.dtype)), -1)
+        rgba = drtk_ops.edge_gradients(rgba, raster)
         if return_triangles:
-            return nrm, rast_out[..., -1]
-        return nrm #C,H,W,4
+            return rgba, (raster.index + 1).to(rgba.dtype)
+        return rgba
 
-    def render_world_xyz(self,
-            vertices: torch.Tensor, #V,3 float
-            faces: torch.Tensor, #F,3 long
-            ) -> torch.Tensor: #C,H,W,4 (x_world, y_world, z_world, alpha)
-        """Rasterize per-pixel WORLD-space XYZ of the current mesh.
-
-        Used by cross-view consistency loss: the world position of a
-        surface point is identical regardless of viewing camera, so the
-        same surface point seen from two views must produce the same XYZ
-        when one view's XYZ map is reprojected into the other view's
-        image plane.
-        """
-        V = vertices.shape[0]
-        faces_i = faces.type(torch.int32)
-        vert_hom = torch.cat((vertices, torch.ones(V, 1, device=vertices.device)), dim=-1) #V,4
-        vertices_clip = vert_hom @ self._mvp.transpose(-2, -1) #C,V,4
-        rast_out, _ = dr.rasterize(self._glctx, vertices_clip, faces_i, resolution=self._image_size, grad_db=False)
-        # nvdiffrast.interpolate requires contiguous attribute tensor.
-        attr = vertices.contiguous()
-        xyz, _ = dr.interpolate(attr, rast_out, faces_i) #C,H,W,3 — world XYZ
-        alpha = torch.clamp(rast_out[..., -1:], max=1) #C,H,W,1
-        return torch.cat((xyz, alpha), dim=-1) #C,H,W,4
+    def render_world_xyz(self, vertices, faces):
+        """Return same-view hard world XYZ/alpha for cross-view geometry losses."""
+        raster = self._raster(vertices, faces)
+        xyz = drtk_ops.interpolate(vertices[None].contiguous(), raster)
+        return torch.cat((xyz, raster.valid[..., None].to(xyz.dtype)), -1)
 
     @property
-    def mvp(self) -> torch.Tensor:
-        """C,4,4 — concatenated proj@mv per view, exposed for cross-view ops."""
+    def mvp(self):
+        """[C,4,4] GL projection@view matrices for cross-view operations."""
         return self._mvp
-
-

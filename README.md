@@ -84,3 +84,9 @@ If you find this codebase useful, please consider cite our work.
   year={2024}
 }
 ```
+
+## Seed DRTK renderer integration
+
+This fork uses the shared `seed.render.drtk_ops` CUDA adapter for reconstruction normal/world-coordinate buffers and source-image first-hit visibility. Install the matching Seed checkout (`pip install -e /path/to/seed`) and the pinned DRTK build into the same existing environment before running. No nvdiffrast or PyTorch3D rasterizer fallback is used. PyTorch3D camera/mesh data types remain in source projection.
+
+DRTK provides hard-forward coverage with visibility-boundary gradients, not fractional nvdiffrast antialiasing. Existing GL row conventions are retained for reconstruction; source-image buffers use top-first rows and camera-view Z. The default one-mesh/one-camera-per-view projection is supported; blur, multiple hits, arbitrary mesh batches and triangle clipping fail explicitly. Native module and upstream model/quality acceptance are separate from renderer adapter tests.

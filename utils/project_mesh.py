@@ -6,104 +6,133 @@ import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from pytorch3d.renderer.cameras import look_at_view_transform, OrthographicCameras, CamerasBase
-from pytorch3d.renderer.mesh.rasterizer import Fragments
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
-    RasterizationSettings,
     TexturesVertex,
     FoVPerspectiveCameras,
     FoVOrthographicCameras,
 )
-from pytorch3d.renderer import MeshRasterizer
 
-def render_pix2faces_py3d(meshes, cameras, H=512, W=512, blur_radius=0.0, faces_per_pixel=1, raster_options=None):
-    """
-    Renders pix2face of visible faces.
+def render_pix2faces_drtk(meshes, cameras, H=512, W=512, blur_radius=0.0,
+                         faces_per_pixel=1, raster_options=None):
+    """DRTK first-hit buffers in the PyTorch3D top-first/view-Z contract.
 
-    :param mesh: Pytorch3d.structures.Meshes
-    :param cameras: pytorch3d.renderer.Cameras
-    :param H: target image height
-    :param W: target image width
-    :param blur_radius: Float distance in the range [0, 2] used to expand the face
-            bounding boxes for rasterization. Setting blur radius
-            results in blurred edges around the shape instead of a
-            hard boundary. Set to 0 for no blur.
-    :param faces_per_pixel: (int) Number of faces to keep track of per pixel.
-            We return the nearest faces_per_pixel faces along the z-axis.
+    PyTorch3D camera transforms remain the projection authority; no PyTorch3D
+    rasterization is invoked. One mesh/camera per image is the existing texture
+    projection contract. Blur, multi-hit and clipping are refused explicitly.
     """
-    # Define the settings for rasterization and shading
-    raster_settings = RasterizationSettings(
-        image_size=(H, W),
-        blur_radius=blur_radius,
-        faces_per_pixel=faces_per_pixel,
-        **(raster_options or {})
-    )
-    rasterizer=MeshRasterizer(
-        cameras=cameras, 
-        raster_settings=raster_settings
-    )
-    fragments: Fragments = rasterizer(meshes, cameras=cameras)
+    from seed.render import drtk_ops
+
+    if blur_radius != 0 or faces_per_pixel != 1:
+        raise NotImplementedError("DRTK texture visibility supports hard first-hit rasterization only")
+    options = dict(raster_options or {})
+    unknown = set(options) - {"bin_size", "max_faces_per_bin"}
+    if unknown:
+        raise NotImplementedError(f"Unsupported DRTK raster options: {sorted(unknown)}")
+    for key, value in options.items():
+        if value is not None and (type(value) is not int or value < 0):
+            raise ValueError(f"{key} must be a nonnegative integer or None")
+    renderer = Pix2FacesRenderer(device=str(meshes.device))
+    raster, view_z = renderer.rasterize(meshes, cameras, H=H, W=W)
+    zbuf = drtk_ops.interpolate(view_z[..., None], raster)[..., 0]
     return {
-        "pix_to_face": fragments.pix_to_face[..., 0],
-        "zbuf": fragments.zbuf[..., 0],
+        "pix_to_face": raster.index.long(),
+        "zbuf": torch.where(raster.valid, zbuf, -torch.ones_like(zbuf)),
+        "backend": "drtk",
+        "projection": raster.projection,
+        "rows": "top-first",
+        "depthSpace": "camera view Z, not projected NDC Z",
+        "rasterTuning": {"ignoredBinOptions": options,
+                         "reason": "DRTK does not use PyTorch3D coarse raster bins"},
     }
 
-import nvdiffrast.torch as dr
 
-def _warmup(glctx, device=None):
-    device = 'cuda' if device is None else device
-    #windows workaround for https://github.com/NVlabs/nvdiffrast/issues/59
-    def tensor(*args, **kwargs):
-        return torch.tensor(*args, device=device, **kwargs)
-    pos = tensor([[[-0.8, -0.8, 0, 1], [0.8, -0.8, 0, 1], [-0.8, 0.8, 0, 1]]], dtype=torch.float32)
-    tri = tensor([[0, 1, 2]], dtype=torch.int32)
-    dr.rasterize(glctx, pos, tri, resolution=[256, 256])
+def render_pix2faces_py3d(*args, **kwargs):
+    """Compatibility spelling; the implementation is now exclusively DRTK."""
+    return render_pix2faces_drtk(*args, **kwargs)
+
 
 class Pix2FacesRenderer:
+    """DRTK visibility with explicit PyTorch3D camera and packed-face semantics."""
+
+    backend = "drtk"
+
     def __init__(self, device="cuda"):
-        self._glctx = dr.RasterizeCudaContext(device=device)
-        self.device = device
-        _warmup(self._glctx, device)
+        self.device = torch.device(device)
+        self._glctx = None
 
-    def transform_vertices(self, meshes: Meshes, cameras: CamerasBase):
-        vertices = cameras.transform_points_ndc(meshes.verts_padded())
+    def _project(self, meshes, cameras, H, W):
+        if type(H) is not int or type(W) is not int or H <= 0 or W <= 0:
+            raise ValueError("Positive integer image dimensions required")
+        if len(meshes) != 1 or len(cameras) != 1:
+            raise NotImplementedError("DRTK texture projection currently requires one mesh and one camera")
+        vertices = meshes.verts_padded()
+        view = cameras.get_world_to_view_transform().transform_points(vertices)
+        ndc = cameras.transform_points_ndc(vertices)
+        if view.shape != vertices.shape or ndc.shape != vertices.shape:
+            raise ValueError("Camera projection must preserve the single-mesh vertex layout")
+        if not torch.isfinite(view).all() or not torch.isfinite(ndc).all():
+            raise ValueError("Camera projection must be finite")
+        view_z = view[..., 2]
+        if bool((view_z <= 0).any()):
+            raise NotImplementedError("DRTK texture projection requires vertices in front of the camera; clipping is unsupported")
+        perspective = bool(cameras.is_perspective())
+        if perspective:
+            znear = cameras.get_znear()
+            if znear is not None:
+                near = torch.as_tensor(znear, device=view_z.device, dtype=view_z.dtype)
+                if bool((view_z < near.min() / 2).any()):
+                    raise NotImplementedError("DRTK near-plane triangle clipping is not implemented")
+            # Bounded GL depth with actual camera Z as homogeneous W. This
+            # retains perspective-correct attributes and harmonic first-hit Z.
+            near = view_z.detach().amin(-1, keepdim=True) / 2
+            far = view_z.detach().amax(-1, keepdim=True) * 2
+            w = view_z
+            clip_z = ((far + near) * view_z - 2 * far * near) / (far - near)
+            projection = "perspective"
+        else:
+            low = view_z.detach().amin(-1, keepdim=True)
+            span = (view_z.detach().amax(-1, keepdim=True) - low).clamp_min(1e-4)
+            clip_z = (view_z - low) / span - 0.5
+            w = torch.ones_like(view_z)
+            projection = "orthographic"
+        # PyTorch3D NDC is +X left, +Y up, and the shorter image dimension
+        # spans [-1,1]. Flipping both axes yields top-first image rows directly
+        # in the GL-row buffer, without an implicit additional output flip.
+        aspect = ndc.new_tensor((W / min(H, W), H / min(H, W)))
+        xy = -ndc[..., :2] / aspect
+        clip = torch.cat((xy * w[..., None], clip_z[..., None], w[..., None]), -1).float().contiguous()
+        return clip, view_z.float().contiguous(), projection
 
-        perspective_correct = cameras.is_perspective()
-        znear = cameras.get_znear()
-        if isinstance(znear, torch.Tensor):
-            znear = znear.min().item()
-        z_clip = None if not perspective_correct or znear is None else znear / 2
+    def transform_vertices(self, meshes, cameras, H=512, W=512):
+        """Compatibility API returning supported GL clip vertices, never deleting vertices."""
+        return self._project(meshes, cameras, H, W)[0]
 
-        if z_clip:
-            vertices = vertices[vertices[..., 2] >= cameras.get_znear()][None]    # clip
-        vertices = vertices * torch.tensor([-1, -1, 1]).to(vertices)
-        vertices = torch.cat([vertices, torch.ones_like(vertices[..., :1])], dim=-1).to(torch.float32)
-        return vertices
+    def rasterize(self, meshes, cameras, H=512, W=512):
+        from seed.render import drtk_ops
 
-    def render_pix2faces_nvdiff(self, meshes: Meshes, cameras: CamerasBase, H=512, W=512):
         meshes = meshes.to(self.device)
         cameras = cameras.to(self.device)
-        vertices = self.transform_vertices(meshes, cameras)
+        clip, view_z, projection = self._project(meshes, cameras, H, W)
         faces = meshes.faces_packed().to(torch.int32)
-        rast_out,_ = dr.rasterize(self._glctx, vertices, faces, resolution=(H, W), grad_db=False) #C,H,W,4
-        pix_to_face = rast_out[..., -1].to(torch.int32) - 1
-        return pix_to_face
+        return drtk_ops.rasterize(clip, faces, (H, W), projection=projection), view_z
+
+    def render_pix2faces_nvdiff(self, meshes, cameras, H=512, W=512):
+        """Compatibility spelling; no nvdiffrast implementation or fallback."""
+        return self.rasterize(meshes, cameras, H, W)[0].index
+
 
 pix2faces_renderer = None
 
-def get_visible_faces(meshes: Meshes, cameras: CamerasBase, resolution=1024):
-    # global pix2faces_renderer
-    # if pix2faces_renderer is None:
-    #     pix2faces_renderer = Pix2FacesRenderer()
-    pix_to_face = render_pix2faces_py3d(meshes, cameras, H=resolution, W=resolution)['pix_to_face']
-    # pix_to_face = pix2faces_renderer.render_pix2faces_nvdiff(meshes, cameras, H=resolution, W=resolution)
 
+def get_visible_faces(meshes: Meshes, cameras: CamerasBase, resolution=1024):
+    pix_to_face = render_pix2faces_drtk(meshes, cameras, H=resolution, W=resolution)["pix_to_face"]
     unique_faces = torch.unique(pix_to_face.flatten())
-    unique_faces = unique_faces[unique_faces != -1]
-    return unique_faces
+    return unique_faces[unique_faces != -1]
+
 
 def get_visibility_buffers(meshes: Meshes, cameras: CamerasBase, resolution=1024, raster_options=None):
-    return render_pix2faces_py3d(meshes, cameras, H=resolution, W=resolution, raster_options=raster_options)
+    return render_pix2faces_drtk(meshes, cameras, H=resolution, W=resolution, raster_options=raster_options)
 
 def project_color(
     meshes: Meshes,

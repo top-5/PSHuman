@@ -101,7 +101,8 @@ nest-asyncio==1.6.0
 networkx==3.2.1
 numba==0.60.0
 numpy==1.26.3
-nvdiffrast @ git+https://github.com/NVlabs/nvdiffrast.git@729261dc64c4241ea36efda84fbf532cc8b425b8
+# Build against the installed Torch/CUDA with --no-build-isolation.
+drtk @ https://github.com/facebookresearch/DRTK/archive/43c3095d01d0ff435c798518e97e387c784b567f.tar.gz#sha256=932e8f3b31383030f2930cd968493c7a5e73dcfc76a372af839d5a047f37fe14
 nvidia-cuda-runtime-cu12==12.6.77
 nvidia-pyindex==1.0.9
 nvidia-tensorrt==99.0.0
