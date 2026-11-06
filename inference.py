@@ -771,7 +771,8 @@ def _soma_views_prior(save_dir: str, scene: str, view_names: List[str], colors, 
                 print(f"[soma] pipeline stays on {home}: {type(exc).__name__}: {exc}", flush=True)
             torch.cuda.empty_cache()
     try:
-        with seed_spans.span("pshuman: SOMA body from the views (seed)"):
+        with seed_spans.span("pshuman: SOMA body from the views (seed)",
+                             controller_selected="native" if os.environ.get("SEED_SOMA_VIEWS_NATIVE_SEARCH") == "1" else "python"):
             subprocess.run(shlex.split(cmd) + [views_dir, out], check=True)
     finally:
         if pipeline is not None:
@@ -815,7 +816,8 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                     _dump_mv_layers(cfg.mv_dump_dir, scene, MV_VIEWS, colors_inj, normals_inj, batch['imgs_in'][0, 0])
                 _soma_views_prior(save_dir, scene, MV_VIEWS, colors_inj, normals_inj, pipeline)
                 pose = econdata.__getitem__(case_id)
-                with seed_spans.span("pshuman: reconstruct (SMPL fit + mesh)", views="injected"):
+                with seed_spans.span("pshuman: reconstruct (SMPL fit + mesh)", views="injected", kind="stage",
+                                     controller_selected="python", evaluator="torch-cuda"):
                     carving.optimize_case(scene, pose, colors_inj, normals_inj)
                 torch.cuda.empty_cache()
                 continue
@@ -1021,7 +1023,8 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                         torch.cuda.synchronize()
         _soma_views_prior(save_dir, scene, MV_VIEWS, colors, normals, pipeline)
         pose = econdata.__getitem__(case_id)
-        with seed_spans.span("pshuman: reconstruct (SMPL fit + mesh)"):
+        with seed_spans.span("pshuman: reconstruct (SMPL fit + mesh)", kind="stage", controller_selected="python",
+                             evaluator="torch-cuda"):
             carving.optimize_case(scene, pose, colors, normals)
         torch.cuda.empty_cache()   
                
