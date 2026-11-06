@@ -1,4 +1,5 @@
 import seed_spans
+import time as _t
 import no_smplx  # first: SEED_NO_SMPLX=1 (a seed SOMA run) refuses SMPL-X in this process
 no_smplx.install()
 from core.remesh import calc_vertex_normals
@@ -1831,6 +1832,7 @@ class ReMesh:
                 # newly-injected arm pixels are treated like regular foreground.
                 smpl_fit_loss_mask, _ = self._build_smpl_fit_loss_mask(masks, case_path)
 
+            _t_smpl = _t.time_ns()
             for i in tqdm(range(smpl_steps)):
                 optimizer_smpl.zero_grad()
                 # 6d_rot to rot_mat
@@ -2031,6 +2033,7 @@ class ReMesh:
                         "beta_delta_mean": float(beta_delta.mean().cpu()),
                         "lr": [float(g["lr"]) for g in optimizer_smpl.param_groups],
                     })
+            seed_spans.emit("pshuman: body-prior fit loop", _t_smpl, _t.time_ns(), steps=int(smpl_steps))
 
             # Diagnostic: dump SMPL-X front-view render after the refinement loop.
             if dump_smpl_diag and smpl_steps > 0:
@@ -2529,6 +2532,7 @@ class ReMesh:
 
         _dump_mesh(0)
         # ###----------------------- optimization iterations-------------------------------------
+        _t_carve = _t.time_ns()
         for i in tqdm(range(self.opt.iters)):
             nrm_opt.zero_grad()
 
@@ -2608,9 +2612,11 @@ class ReMesh:
                 # mesh_remeshed.export(f'{case_path}/{case}_remeshed_step{i}.obj')
             torch.cuda.empty_cache() 
             
+        seed_spans.emit("pshuman: carve optimizer loop (with remesh)", _t_carve, _t.time_ns(), iters=int(self.opt.iters))
         if arm_normal_enabled:
             with open(os.path.join(case_path, "arm_normal_confidence.json"), "w") as _out:
                 json.dump(arm_report, _out, indent=2)
+        _t_final = _t.time_ns()
         mesh_remeshed = trimesh.Trimesh(vertices=vertices.detach().cpu().numpy(), faces=faces.detach().cpu().numpy())
         mesh_remeshed.export(f'{case_path}/{case}_remeshed.obj')
         # save_mesh(case, vertices, faces)
@@ -2730,6 +2736,7 @@ class ReMesh:
                 ortho_scale=float(self.opt.scale) / 2.0,
                 report_path=f'{case_path}/{case}_arm_rebuild.json',
             )
+        seed_spans.emit("pshuman: remesh export and Poisson final mesh", _t_final, _t.time_ns())
         vertices = torch.from_numpy(final.vertices).float().to(self.device)
         faces = torch.from_numpy(final.faces).long().to(self.device)
         # Differing from paper, we use the texturing method in Unique3D
@@ -2763,6 +2770,7 @@ class ReMesh:
         masked_fallback = None
         if fallback_color is not None:
             masked_fallback = [torch.from_numpy(np.array(tmp.resize((self.resolution, self.resolution), Image.BILINEAR)).astype(np.float32) / 255.).permute(2, 0, 1).to(self.device) for tmp in fallback_color]
+        _t_colour = _t.time_ns()
         meshes = self.proj_texture(masked_color, vertices, faces, normal_images=masked_normals,
                                    fallback_images=masked_fallback, source_only=source_only,
                                    support_silhouettes=support_silhouettes)
@@ -2770,6 +2778,7 @@ class ReMesh:
         faces = meshes.faces_packed().long()
         colors = meshes.textures.verts_features_packed().float()
         save_mesh(f'{case_path}/result_clr_scale{self.opt.scale}_{case}.obj', vertices, faces, colors)
+        seed_spans.emit("pshuman: colour projection and save", _t_colour, _t.time_ns())
         self.evaluate(vertices, colors, faces,  save_path=f'{case_path}/result_clr_scale{self.opt.scale}_{case}.mp4', save_nrm=True)
         
 
