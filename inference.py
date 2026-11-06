@@ -816,7 +816,7 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                     _dump_mv_layers(cfg.mv_dump_dir, scene, MV_VIEWS, colors_inj, normals_inj, batch['imgs_in'][0, 0])
                 _soma_views_prior(save_dir, scene, MV_VIEWS, colors_inj, normals_inj, pipeline)
                 pose = econdata.__getitem__(case_id)
-                with seed_spans.span("pshuman: reconstruct (SMPL fit + mesh)", views="injected", kind="stage",
+                with seed_spans.span("pshuman: reconstruct (SMPL fit + mesh)", views="injected",
                                      controller_selected="python", evaluator="torch-cuda"):
                     carving.optimize_case(scene, pose, colors_inj, normals_inj)
                 torch.cuda.empty_cache()
@@ -1023,7 +1023,7 @@ def run_inference(dataloader, econdata, pipeline, carving, cfg: TestConfig,  sav
                         torch.cuda.synchronize()
         _soma_views_prior(save_dir, scene, MV_VIEWS, colors, normals, pipeline)
         pose = econdata.__getitem__(case_id)
-        with seed_spans.span("pshuman: reconstruct (SMPL fit + mesh)", kind="stage", controller_selected="python",
+        with seed_spans.span("pshuman: reconstruct (SMPL fit + mesh)", controller_selected="python",
                              evaluator="torch-cuda"):
             carving.optimize_case(scene, pose, colors, normals)
         torch.cuda.empty_cache()   
