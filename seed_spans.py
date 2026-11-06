@@ -4,25 +4,25 @@ seed runs PSHuman as a subprocess with SEED_TRACE_FILE / SEED_TRACE_ID / SEED_TR
 here is a no-op. Owner 2026-10-12: "do we have spans for model load times?" -- PSHuman was one opaque span per pass.
 """
 import contextlib
+import functools
 import json
 import os
 import secrets
 import socket
 import time
-import functools
 
 #: when this module was first imported: the process start, near enough (it is imported at the top of inference.py)
 PROCESS_T0_NS = time.time_ns()
 
 
-def emit(name, start_ns, end_ns, **attributes):
+def emit(name, start_ns, end_ns, status="ok", **attributes):
     path = os.environ.get("SEED_TRACE_FILE")
     if not path:
         return
     line = json.dumps({
         "trace_id": os.environ.get("SEED_TRACE_ID") or "0" * 32, "span_id": secrets.token_hex(8),
         "parent_span_id": os.environ.get("SEED_TRACE_PARENT") or None, "name": name,
-        "start_unix_nano": int(start_ns), "end_unix_nano": int(end_ns), "status": "ok",
+        "start_unix_nano": int(start_ns), "end_unix_nano": int(end_ns), "status": status,
         "attributes": {"kind": "pshuman_phase", **{k: v if isinstance(v, (int, float, str, bool)) else str(v)
                                                    for k, v in attributes.items()}},
         "resource": {"host": socket.gethostname(), "pid": os.getpid(), "process": "pshuman"},
@@ -37,10 +37,15 @@ def emit(name, start_ns, end_ns, **attributes):
 @contextlib.contextmanager
 def span(name, **attributes):
     t0 = time.time_ns()
+    status = "ok"
     try:
         yield
+    except BaseException as error:
+        status = "error"
+        attributes.setdefault("error", f"{type(error).__name__}: {error}"[:300])
+        raise
     finally:
-        emit(name, t0, time.time_ns(), **attributes)
+        emit(name, t0, time.time_ns(), status=status, **attributes)
 
 
 def profile_stage(name):
@@ -60,8 +65,14 @@ def profile_stage(name):
                 torch.cuda.synchronize()
             start = time.time_ns()
             before = torch.cuda.memory_allocated() if cuda else 0
+            status = 'ok'
+            error_attribute = {}
             try:
                 return function(*args, **kwargs)
+            except BaseException as error:
+                status = 'error'
+                error_attribute['error'] = f'{type(error).__name__}: {error}'[:300]
+                raise
             finally:
                 if torch.cuda.is_initialized():
                     torch.cuda.synchronize()
@@ -70,6 +81,7 @@ def profile_stage(name):
                                   cuda_reserved_end=torch.cuda.memory_reserved())
                 else:
                     memory = {}
-                emit('pshuman profile: ' + name, start, time.time_ns(), cuda_synchronized=True, **memory)
+                emit('pshuman profile: ' + name, start, time.time_ns(), status=status,
+                     cuda_synchronized=True, **memory, **error_attribute)
         return wrapped
     return decorate
