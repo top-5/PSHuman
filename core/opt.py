@@ -13,7 +13,9 @@ def remesh(
         min_edgelen:torch.Tensor, #V
         max_edgelen:torch.Tensor, #V
         flip:bool,
-        max_vertices=1e6
+        max_vertices=1e6,
+        collapse_adjacency=None,
+        generator:torch.Generator|None=None,
         ):
 
     # dummies
@@ -24,11 +26,33 @@ def remesh(
     max_edgelen = torch.concat((nan_tensor,max_edgelen))
 
     # collapse
-    edges,face_to_edge = calc_edges(faces) #E,2 F,3
+    if collapse_adjacency is None:
+        edges,face_to_edge = calc_edges(faces) #E,2 F,3
+    else:
+        # ``MeshOptimizer.step`` has just built adjacency for the same topology.
+        # Remesh prepends one dummy vertex/face, so transform the cached indices
+        # instead of sorting/uniquing the full face-edge list again.
+        cached_edges, cached_face_to_edge = collapse_adjacency
+        edges = torch.cat((torch.zeros((1, 2), dtype=cached_edges.dtype, device=cached_edges.device),
+                           cached_edges + 1), dim=0)
+        face_to_edge = torch.cat((torch.zeros((1, 3), dtype=cached_face_to_edge.dtype,
+                                              device=cached_face_to_edge.device),
+                                  cached_face_to_edge + 1), dim=0)
     edge_length = calc_edge_length(vertices,edges) #E
     face_normals = calc_face_normals(vertices,faces,normalize=False) #F,3
     vertex_normals = calc_vertex_normals(vertices,faces,face_normals) #V,3
-    face_collapse = calc_face_collapses(vertices,faces,edges,face_to_edge,edge_length,face_normals,vertex_normals,min_edgelen,area_ratio=0.5)
+    face_collapse = calc_face_collapses(
+        vertices,
+        faces,
+        edges,
+        face_to_edge,
+        edge_length,
+        face_normals,
+        vertex_normals,
+        min_edgelen,
+        area_ratio=0.5,
+        generator=generator,
+    )
     shortness = (1 - edge_length / min_edgelen[edges].mean(dim=-1)).clamp_min_(0) #e[0,1] 0...ok, 1...edgelen=0
     priority = face_collapse.float() + shortness
     vertices_etc,faces = collapse_edges(vertices_etc,faces,edges,priority)
@@ -135,6 +159,19 @@ class MeshOptimizer:
         self._local_edgelen = local_edgelen
         self._step = 0
         self._start = time.time()
+        self._collapse_adjacency = None
+        self._reuse_step_adjacency = os.environ.get(
+            "PSHUMAN_REUSE_STEP_ADJACENCY", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._remesh_generator = None
+        remesh_seed = os.environ.get("PSHUMAN_REMESH_SEED")
+        if remesh_seed not in (None, ""):
+            try:
+                remesh_seed = int(remesh_seed)
+            except ValueError as error:
+                raise ValueError("PSHUMAN_REMESH_SEED must be an integer") from error
+            self._remesh_generator = torch.Generator(device=vertices.device)
+            self._remesh_generator.manual_seed(remesh_seed)
 
         V = self._vertices.shape[0]
         # prepare continuous tensor for all vertex-based data 
@@ -183,7 +220,8 @@ class MeshOptimizer:
 
         self._step += 1
         # spatial smoothing
-        edges,_ = calc_edges(self._faces) #E,2
+        edges,face_to_edge = calc_edges(self._faces) #E,2 F,3
+        self._collapse_adjacency = (edges, face_to_edge) if self._reuse_step_adjacency else None
         E = edges.shape[0]
         edge_smooth = self._smooth[edges] #E,2,S
         neighbor_smooth = torch.zeros_like(self._smooth) #V,S
@@ -241,7 +279,17 @@ class MeshOptimizer:
         min_edge_len = self._ref_len * (1 - self._edge_len_tol)
         max_edge_len = self._ref_len * (1 + self._edge_len_tol)
             
-        self._vertices_etc,self._faces = remesh(self._vertices_etc,self._faces,min_edge_len,max_edge_len,flip)
+        collapse_adjacency = self._collapse_adjacency
+        self._collapse_adjacency = None
+        self._vertices_etc,self._faces = remesh(
+            self._vertices_etc,
+            self._faces,
+            min_edge_len,
+            max_edge_len,
+            flip,
+            collapse_adjacency=collapse_adjacency,
+            generator=self._remesh_generator,
+        )
 
         self._split_vertices_etc()
         if os.environ.get("PSHUMAN_REMESH_UNTANGLE", "0").strip().lower() in {"1", "true", "yes", "on"}:

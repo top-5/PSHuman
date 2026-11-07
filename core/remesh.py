@@ -251,7 +251,8 @@ def calc_face_collapses(
         vertex_normals:torch.Tensor, #V,3 first unused
         min_edge_length:torch.Tensor=None, #V
         area_ratio = 0.5, #collapse if area < min_edge_length**2 * area_ratio
-        shortest_probability = 0.8
+        shortest_probability = 0.8,
+        generator: torch.Generator | None = None,
         )->torch.Tensor: #E edges to collapse
     
     E = edges.shape[0]
@@ -274,7 +275,13 @@ def calc_face_collapses(
     if shortest_probability<1:
         #select shortest edge with shortest_probability chance
         randlim = round(2/(1-shortest_probability))
-        rand_ind = torch.randint(0,randlim,size=(F,),device=faces.device).clamp_max_(2) #selected edge local index in face
+        rand_ind = torch.randint(
+            0,
+            randlim,
+            size=(F,),
+            device=faces.device,
+            generator=generator,
+        ).clamp_max_(2) #selected edge local index in face
         sort_ind = torch.argsort(face_length,dim=-1,descending=True) #F,3
         local_ind = sort_ind.gather(dim=-1,index=rand_ind[:,None])
     else:

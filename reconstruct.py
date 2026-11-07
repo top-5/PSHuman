@@ -2532,6 +2532,14 @@ class ReMesh:
 
         _dump_mesh(0)
         # ###----------------------- optimization iterations-------------------------------------
+        # Qualification switch for allocator churn. Preserve the historical
+        # behavior unless a controlled benchmark explicitly disables it.
+        empty_cache_each_iter = _env_bool("PSHUMAN_EMPTY_CACHE_EACH_ITER", True)
+        profile_carve = os.environ.get("PSHUMAN_PROFILE_STAGES") == "1"
+        empty_cache_calls = 0
+        if profile_carve and torch.cuda.is_initialized():
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
         _t_carve = _t.time_ns()
         for i in tqdm(range(self.opt.iters)):
             nrm_opt.zero_grad()
@@ -2610,9 +2618,30 @@ class ReMesh:
                 imageio.imwrite(f'{case_path}/normals/{i:04d}.png',(nrm.detach()[0,:,:,:3]*255).clamp(max=255).type(torch.uint8).cpu().numpy())
                 # mesh_remeshed = trimesh.Trimesh(vertices=vertices.detach().cpu().numpy(), faces=faces.detach().cpu().numpy())
                 # mesh_remeshed.export(f'{case_path}/{case}_remeshed_step{i}.obj')
-            torch.cuda.empty_cache() 
+            if empty_cache_each_iter:
+                torch.cuda.empty_cache()
+                empty_cache_calls += 1
             
-        seed_spans.emit("pshuman: carve optimizer loop (with remesh)", _t_carve, _t.time_ns(), iters=int(self.opt.iters))
+        carve_memory = {}
+        if profile_carve and torch.cuda.is_initialized():
+            torch.cuda.synchronize()
+            memory_stats = torch.cuda.memory_stats()
+            carve_memory = {
+                "cuda_peak_allocated": torch.cuda.max_memory_allocated(),
+                "cuda_peak_reserved": torch.cuda.max_memory_reserved(),
+                "cuda_inactive_split_peak": memory_stats.get("inactive_split_bytes.all.peak", 0),
+                "cuda_allocation_retries": memory_stats.get("num_alloc_retries", 0),
+                "cuda_ooms": memory_stats.get("num_ooms", 0),
+            }
+        seed_spans.emit(
+            "pshuman: carve optimizer loop (with remesh)",
+            _t_carve,
+            _t.time_ns(),
+            iters=int(self.opt.iters),
+            empty_cache_each_iter=empty_cache_each_iter,
+            empty_cache_calls=empty_cache_calls,
+            **carve_memory,
+        )
         if arm_normal_enabled:
             with open(os.path.join(case_path, "arm_normal_confidence.json"), "w") as _out:
                 json.dump(arm_report, _out, indent=2)
